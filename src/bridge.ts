@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { allowedPath, type Config } from './config.js';
 import { Store, stableId, type Binding, type Inbox } from './store.js';
-import { card, splitMarkdown, type CardAction } from './cards.js';
+import { card, latestMarkdown, splitMarkdown, type CardAction } from './cards.js';
 
 export interface CodexPort extends EventEmitter {
   request<T=any>(method:string,params?:unknown):Promise<T>;
@@ -202,24 +202,30 @@ export class Bridge {
     const t=await this.read(b.thread); this.checkThread(t);
     const turns=t.turns??[], latest=turns.at(-1);
     const items=latest?.items??[];
-    const assistantItems=items.filter((x:any)=>x.type==='agentMessage');
-    const messages=assistantItems.map((x:any)=>String(x.text??''));
+    const messages=items.filter((x:any)=>x.type==='agentMessage').map((x:any)=>String(x.text??''));
+    // A new turn can be running tools before its first reply. Keep the most
+    // recent available assistant reply visible while that turn is in progress.
+    const assistantItems=turns.flatMap(turn=>(turn.items??[]).filter((x:any)=>x.type==='agentMessage'));
     const ops=items.filter((x:any)=>['commandExecution','fileChange','mcpToolCall','webSearch'].includes(x.type)).slice(-5).map((x:any)=>`- ${x.type} · ${x.status??'已记录'}`);
     const live=this.streams.get(b.thread);
     const liveText=live&&live.turn===latest?.id?[...live.items.entries()].filter(([id,text])=>!assistantItems.some((x:any)=>x.id===id&&String(x.text??'').includes(text))).map(([,text])=>text).join('\n\n'):'';
-    const displayed=[messages.join('\n\n'),liveText?`**正在输出**\n${liveText}`:''].filter(Boolean).join('\n\n')||'暂无新的模型回复';
-    const body=`**${textId(t.name||t.preview||t.id)}**\n目录：${t.cwd}\n会话：\`${t.id}\`\n状态：${latest?.status??t.status?.type??'未知'}${ops.length?'\n\n'+ops.join('\n'):''}\n\n${displayed}`;
+    const displayed=[assistantItems.map((x:any)=>String(x.text??'')).join('\n\n'),liveText?`**正在输出**\n${liveText}`:''].filter(Boolean).join('\n\n')||'暂无新的模型回复';
+    const heading=`**${textId(t.name||t.preview||t.id)}**\n目录：${t.cwd}\n会话：\`${t.id}\`\n状态：${latest?.status??t.status?.type??'未知'}${ops.length?'\n\n'+ops.join('\n'):''}\n\n`;
+    const notice='（以下为截至最新回复的最近内容，较早内容已省略。）\n\n';
+    const budget=12_000-Buffer.byteLength(heading,'utf8');
+    let window=latestMarkdown(displayed,budget);
+    if(window.truncated)window=latestMarkdown(displayed,budget-Buffer.byteLength(notice,'utf8'));
+    const body=heading+(window.truncated?notice:'')+window.markdown;
     const fp=stableId(body);
     if(force||fp!==b.fingerprint) {
-      const parts=splitMarkdown(body);
       const pending=this.store.pendingFor(b.thread);
-      this.store.putCard(`status:${b.thread}`,b.chat,card(`${this.config.host} · 最新进展`,parts[0]??'',[
+      this.store.putCard(`status:${b.thread}`,b.chat,card(`${this.config.host} · 最新进展`,body,[
         {label:'刷新',command:`/status ${b.thread}`},{label:'中断当前轮次',command:`/interrupt ${b.thread}`,type:'danger'},{label:'切换会话',command:'/sessions'}]));
       // Every complete answer part has a stable key and survives restarts.
       if(latest?.id&&latest.status!=='inProgress') {
         splitMarkdown(messages.join('\n\n')).filter(Boolean).forEach((part,i)=>this.store.putCard(`answer:${b.thread}:${latest.id}:${i}`,b.chat,card(`${this.config.host} · 回答 ${i+1}`,part)));
-      } else if(parts.length>1) {
-        this.store.putCard(`overflow:${b.thread}`,b.chat,card('内容较长','完整回复将在轮次结束后分卡片送达。'));
+      } else if(window.truncated) {
+        this.store.putCard(`overflow:${b.thread}`,b.chat,card('内容较长','最新进展卡片已按模型最新回复向前截取，优先展示最近内容。完整回复仍将在轮次结束后分卡片送达。'));
       }
       for(const p of pending)this.renderPending(p.token);
       this.store.fingerprint(b.chat,b.user,fp);

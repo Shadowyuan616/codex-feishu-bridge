@@ -359,6 +359,58 @@ test('live output from item B is visible alongside already persisted commentary 
   assert.ok(body.includes('正在输出'));
 });
 
+test('long goal progress keeps the latest entire reply and pinned metadata inside the card budget', async (t) => {
+  const f=fixture(t);
+  const last='最新进展：最后一批文件已复制，开始校验。';
+  const turn={id:'long-goal',status:'inProgress',items:[
+    {id:'old',type:'agentMessage',text:'EARLIEST_HISTORY\n'+'很长的历史记录🙂\n'.repeat(3000)},
+    {id:'recent',type:'agentMessage',text:last},
+  ]};
+  f.thread.status={type:'active'};f.thread.turns=[turn];
+  f.store.bind('chat-a','ou_owner',f.thread.id,f.cwd);
+  await f.bridge.refresh(f.store.binding('chat-a','ou_owner')!,true);
+  const body=progressMarkdown(f);
+  assert.ok(body.endsWith(last));
+  assert.ok(body.includes(f.thread.id));assert.ok(body.includes(f.cwd));
+  assert.ok(body.includes('较早内容已省略'));
+  assert.ok(!body.includes('EARLIEST_HISTORY'));
+  assert.ok(Buffer.byteLength(body)<=12_000);
+  turn.items.push({id:'newest',type:'agentMessage',text:'下一次回复：校验仍在继续。'});
+  await f.bridge.refresh(f.store.binding('chat-a','ou_owner')!);
+  assert.ok(progressMarkdown(f).endsWith('下一次回复：校验仍在继续。'));
+});
+
+test('one oversized reply and later live output remain anchored at their latest ends', async (t) => {
+  const f=fixture(t);
+  f.thread.status={type:'active'};
+  f.thread.turns=[{id:'long-goal',status:'inProgress',items:[
+    {id:'reply',type:'agentMessage',text:'OLD_REPLY_START\n'+'过长的单条回复🙂'.repeat(3000)+'最新回复的末尾'},
+  ]}];
+  f.store.bind('chat-a','ou_owner',f.thread.id,f.cwd);
+  await f.bridge.refresh(f.store.binding('chat-a','ou_owner')!,true);
+  assert.ok(progressMarkdown(f).endsWith('最新回复的末尾'));
+  assert.ok(!progressMarkdown(f).includes('OLD_REPLY_START'));
+  f.codex.emit('notification','item/agentMessage/delta',{
+    threadId:f.thread.id,turnId:'long-goal',itemId:'live',delta:'正在生成的最新内容🙂',
+  });
+  await f.bridge.refresh(f.store.binding('chat-a','ou_owner')!);
+  assert.ok(progressMarkdown(f).endsWith('正在生成的最新内容🙂'));
+  assert.ok(Buffer.byteLength(progressMarkdown(f))<=12_000);
+});
+
+test('a new turn with no reply still shows the last available assistant reply', async (t) => {
+  const f=fixture(t);
+  f.thread.status={type:'active'};
+  f.thread.turns=[
+    {id:'previous',status:'completed',items:[{id:'reply',type:'agentMessage',text:'最后一次回复：继续监控数据传输。'}]},
+    {id:'current',status:'inProgress',items:[{id:'tool',type:'commandExecution',status:'inProgress'}]},
+  ];
+  f.store.bind('chat-a','ou_owner',f.thread.id,f.cwd);
+  await f.bridge.refresh(f.store.binding('chat-a','ou_owner')!,true);
+  assert.ok(progressMarkdown(f).endsWith('最后一次回复：继续监控数据传输。'));
+  assert.ok(progressMarkdown(f).includes('状态：inProgress'));
+});
+
 test('new deltas for a partially persisted item appear and disappear from live area after persistence', async (t) => {
   const f = fixture(t);
   const item = { id: 'item-a', type: 'agentMessage', text: '回复开头' };

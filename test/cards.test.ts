@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { card, splitMarkdown } from '../src/cards.js';
+import { card, latestMarkdown, splitMarkdown } from '../src/cards.js';
 
 test('card uses schema 2.0, source Markdown, and explicit callback commands', () => {
   const markdown = '## 最新进展\n\n```ts\nconst value = 1;\n```';
@@ -82,4 +82,45 @@ test('rejects invalid budgets and an impossibly large atomic fence', () => {
     assert.throws(() => splitMarkdown('text', budget), RangeError);
   }
   assert.throws(() => splitMarkdown('`'.repeat(100) + '\ncode', 64), RangeError);
+});
+
+test('latest window fills backward from the final reply instead of taking a forward chunk', () => {
+  const text='EARLIEST_HISTORY\n'+'中文🙂 history\n'.repeat(500)+'LATEST_REPLY_END';
+  const result=latestMarkdown(text,512);
+  assert.equal(result.truncated,true);
+  assert.ok(result.markdown.endsWith('LATEST_REPLY_END'));
+  assert.ok(!result.markdown.includes('EARLIEST_HISTORY'));
+  assert.ok(Buffer.byteLength(result.markdown)>=508);
+  assert.ok(Buffer.byteLength(result.markdown)<=512);
+  assert.ok(text.endsWith(result.markdown));
+  assert.equal(Buffer.from(result.markdown).toString(),result.markdown);
+});
+
+test('latest window preserves small replies and truncates a huge single line at code point boundaries', () => {
+  assert.deepEqual(latestMarkdown('完整最新回复🙂'),{markdown:'完整最新回复🙂',truncated:false});
+  for(const budget of [64,65,127,512]) {
+    const text='起点'+ '汉🙂'.repeat(1000)+'最后回复🙂';
+    const {markdown,truncated}=latestMarkdown(text,budget);
+    assert.ok(truncated);
+    assert.ok(text.endsWith(markdown));
+    assert.ok(markdown.endsWith('最后回复🙂'));
+    assert.ok(Buffer.byteLength(markdown)<=budget);
+    assert.ok(Buffer.byteLength(markdown)>=budget-3);
+    assert.ok(!markdown.includes('\uFFFD'));
+  }
+});
+
+test('latest window restores fences when its start falls inside completed or streaming code', () => {
+  for(const marker of ['```','~~~~']) {
+    for(const complete of [false,true]) {
+      const raw='旧说明\n'+marker+'ts\n'+'const 中文 = "🙂";\n'.repeat(100)+'LATEST_CODE_END\n'+(complete?marker:'');
+      const {markdown,truncated}=latestMarkdown(raw,256);
+      assert.ok(truncated);
+      assert.ok(markdown.startsWith(marker+'ts\n'));
+      assert.ok(markdown.includes('LATEST_CODE_END'));
+      assert.ok(markdown.endsWith('\n'+marker));
+      assert.ok(Buffer.byteLength(markdown)<=256);
+    }
+  }
+  assert.deepEqual(latestMarkdown('```ts\nlatest'),{markdown:'```ts\nlatest\n```',truncated:false});
 });

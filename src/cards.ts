@@ -44,6 +44,55 @@ export function card(
 type Fence = { marker: string; opener: string };
 const bytes = (text: string): number => Buffer.byteLength(text, 'utf8');
 
+/** A byte-bounded window anchored at the end, with fences kept readable. */
+export function latestMarkdown(text: string, maxBytes = 12_000): { markdown: string; truncated: boolean } {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 64) {
+    throw new RangeError('maxBytes must be an integer of at least 64');
+  }
+  const lines: { start: number; end: number; fence?: Fence; atomic: boolean }[] = [];
+  let fence: Fence | undefined;
+  let offset = 0;
+  for (const line of text.match(/[^\n]*\n|[^\n]+$/g) || []) {
+    const before = fence;
+    const stripped = line.replace(/\r?\n$/, '');
+    const match = /^( {0,3})(`{3,}|~{3,})(.*)$/.exec(stripped);
+    const marker = match?.[2], tail = match?.[3] || '';
+    const closes = !!(fence && marker && marker[0] === fence.marker[0]
+      && marker.length >= fence.marker.length && /^\s*$/.test(tail));
+    const opens = !!(!fence && marker && !(marker[0] === '`' && tail.includes('`')));
+    if (closes) fence = undefined;
+    else if (opens) fence = { marker: marker!, opener: stripped };
+    lines.push({ start: offset, end: offset + line.length, fence: before, atomic: closes || opens });
+    offset += line.length;
+  }
+  const closing = fence ? `${text.endsWith('\n') ? '' : '\n'}${fence.marker}` : '';
+  if (bytes(text + closing) <= maxBytes) return { markdown: text + closing, truncated: false };
+
+  let selected = '';
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i]!;
+    const prefix = line.fence ? `${line.fence.opener}\n` : '';
+    const candidate = prefix + text.slice(line.start) + closing;
+    if (bytes(candidate) <= maxBytes) { selected = candidate; continue; }
+    // Never cut a fence marker or language declaration in half.
+    if (line.atomic) {
+      if (!selected) throw new RangeError('Code fence exceeds maxBytes');
+      break;
+    }
+    const rest = text.slice(line.end);
+    const room = maxBytes - bytes(prefix + rest + closing);
+    if (room >= 0) {
+      const encoded = Buffer.from(text.slice(line.start, line.end), 'utf8');
+      let start = Math.max(0, encoded.length - room);
+      // Start on a complete Unicode code point, not a UTF-8 continuation byte.
+      while (start < encoded.length && (encoded[start]! & 0xc0) === 0x80) start++;
+      selected = prefix + encoded.subarray(start).toString('utf8') + rest + closing;
+    }
+    break;
+  }
+  return { markdown: selected, truncated: true };
+}
+
 /**
  * Split UTF-8 Markdown into independently readable chunks. Every returned chunk
  * fits maxBytes, including inserted closing/reopening code fences. Prefer whole
