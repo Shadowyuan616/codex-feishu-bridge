@@ -1,0 +1,22 @@
+[Unit]
+Description=Start an existing shared Codex daemon if it is not running
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Use the same account and CODEX_HOME that own the existing daemon.
+User=REPLACE_WITH_CODEX_OS_USER
+EnvironmentFile=/absolute/persistent/path/codex-feishu-bridge/bridge.env
+ExecStart=/absolute/path/to/managed/codex app-server daemon start
+Restart=on-failure
+RestartSec=15
+TimeoutStartSec=90
+# No ExecStop: stopping this bootstrap unit must not terminate active sessions.
+KillMode=process
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

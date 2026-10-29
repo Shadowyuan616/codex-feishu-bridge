@@ -40,6 +40,12 @@ supervisor 持有 `flock` 独占锁；重复启动退出码为 75。异常退出
 
 ## 验收要求
 
+### 可选：系统启动时确保 Codex daemon 存在
+
+`codex-daemon-ensure.service` 是独立的 oneshot 模板，只调用幂等 `daemon start`；不要替换成会改设置的 `bootstrap`。设置正确用户、二进制、HOME/CODEX_HOME 和环境文件后，可让 bridge 的 `Wants`/`After` 指向该单元。不要设置 `PartOf`、`BindsTo` 或 daemon 的 `ExecStop`，避免重启 bridge 连带中断模型任务。
+
+`RemainAfterExit=yes` 让启动单元成功后保持 active；`KillMode=process` 明确保留已经独立运行的 daemon。该单元只保障启动顺序，**不监控 daemon 后续是否崩溃，也不提供 Workspace 销毁后的数据恢复**。重启机器的验证必须安排在可中断其他任务的窗口。
+
 启动后分别验证：飞书消息进入 inbox、目录/会话菜单、只读历史、用户指定测试 session 的单轮输入和最终卡片、审批/拒绝、worker 重启后的绑定恢复、断线期间重复消息去重。最后在关闭 Mac 与 SSH 连接后检查 worker 仍在响应。容器重建测试必须安排在没有关键任务运行的窗口，不能为验收中断其他会话或传输。
 
 服务自动恢复不保证外部操作恰好执行一次。提交中断的请求会标记结果待核对，恢复时先读历史，不自动重发模型指令。
