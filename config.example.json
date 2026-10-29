@@ -1,0 +1,18 @@
+{
+  "host": "dev-a",
+  "stateDir": "/absolute/local-persistent-path/codex-feishu-bridge-state",
+  "allowedUsers": ["ou_REPLACE_WITH_YOUR_OPEN_ID"],
+  "allowedRoots": ["/absolute/project-root"],
+  "lark": {
+    "binary": "/absolute/path/to/lark-cli",
+    "profile": "your-existing-profile",
+    "cwd": "/absolute/existing-lark-workspace"
+  },
+  "codex": {
+    "binary": "/absolute/path/to/codex",
+    "args": [],
+    "socketPath": "/absolute/existing-codex-home/app-server-control/app-server-control.sock",
+    "env": {"CODEX_HOME": "/absolute/existing-codex-home"}
+  },
+  "pollIntervalMs": 10000
+}

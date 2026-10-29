@@ -1,0 +1,26 @@
+{
+  "name": "codex-feishu-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Persistent Feishu CLI frontend for shared Codex sessions",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test test/*.test.ts",
+    "start": "node dist/src/main.js",
+    "dev": "node --import tsx src/main.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.0",
+    "@types/ws": "8.18.2",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.3"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  }
+}

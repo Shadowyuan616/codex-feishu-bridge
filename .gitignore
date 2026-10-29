@@ -10,3 +10,5 @@ config.local.*
 *.log
 .DS_Store
 .runtime/
+__pycache__/
+*.pyc

@@ -1,0 +1,22 @@
+[Unit]
+Description=Persistent Feishu frontend for a shared Codex daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/codex-feishu-bridge/bridge.env
+WorkingDirectory=%h
+# The same supervisor lock applies to both deployment choices.
+ExecStart=/usr/bin/env ${BRIDGE_PYTHON} ${BRIDGE_ROOT}/deploy/supervise.py --state-dir ${BRIDGE_STATE_DIR} --log-dir ${BRIDGE_LOG_DIR} -- ${BRIDGE_NODE} ${BRIDGE_ROOT}/dist/src/main.js --config ${BRIDGE_CONFIG}
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=25
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

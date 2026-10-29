@@ -1,0 +1,24 @@
+[Unit]
+Description=Persistent Feishu frontend for an existing shared Codex daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# Replace this with the OS account that already owns Codex and Feishu credentials.
+# On a root-owned developer container this may explicitly be root.
+User=REPLACE_WITH_CODEX_OS_USER
+EnvironmentFile=/absolute/persistent/path/codex-feishu-bridge/bridge.env
+WorkingDirectory=/
+ExecStart=/usr/bin/env ${BRIDGE_PYTHON} ${BRIDGE_ROOT}/deploy/supervise.py --state-dir ${BRIDGE_STATE_DIR} --log-dir ${BRIDGE_LOG_DIR} -- ${BRIDGE_NODE} ${BRIDGE_ROOT}/dist/src/main.js --config ${BRIDGE_CONFIG}
+Restart=on-failure
+RestartSec=10
+KillMode=control-group
+TimeoutStopSec=25
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
