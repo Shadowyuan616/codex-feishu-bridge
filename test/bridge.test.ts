@@ -29,6 +29,12 @@ class FakeCodex extends EventEmitter implements CodexPort {
       data: [...(this.threads.get(params.threadId)?.turns || [])].reverse().slice(0, params.limit),
       nextCursor: null,
     } as T;
+    if (method === 'thread/items/list') {
+      const items = (this.threads.get(params.threadId)?.turns || []).flatMap(turn =>
+        (turn.items || []).map((item: any) => ({turnId: turn.id, item}))).reverse();
+      const offset = Number(params.cursor || 0);
+      return {data:items.slice(offset,offset+params.limit),nextCursor:offset+params.limit<items.length?String(offset+params.limit):null} as T;
+    }
     if (['turn/start', 'turn/steer'].includes(method)) {
       if (this.failSubmit) throw new Error('response lost after request submission');
       return { turn: { id: params.expectedTurnId || 'new-turn-123' } } as T;
@@ -93,6 +99,89 @@ async function send(f: ReturnType<typeof fixture>, id: string, text: string, cha
   f.bridge.receive({ id, text, chatId: chat, userId: user, kind: 'text' });
   return settled(f.store, id);
 }
+
+function selectionButtons(value: any): {label:string;command:string}[] {
+  if (!value || typeof value !== 'object') return [];
+  if (value.tag === 'button') return [{label:value.text.content,command:value.value.command}];
+  return Object.values(value).flatMap(selectionButtons);
+}
+
+function visibleText(value: any): string {
+  if (!value || typeof value !== 'object') return '';
+  return Object.entries(value).map(([key,child]) => key==='content'&&typeof child==='string'?child:visibleText(child)).filter(Boolean).join('\n');
+}
+
+test('directory entries use matching numbered leaf labels and paginate every directory', async t => {
+  const f=fixture(t);f.codex.threads.clear();
+  for(let i=1;i<=17;i++) {
+    const cwd=join(f.root,'workspaces',`project-${i}`);mkdirSync(cwd,{recursive:true});
+    f.codex.threads.set(`directory-thread-${i}`,{id:`directory-thread-${i}`,cwd,name:`thread ${i}`});
+  }
+  await send(f,'dirs-first','/dirs');
+  const first=f.lark.sent.at(-1)!.body,buttons=selectionButtons(first);
+  assert.deepEqual(buttons.filter(x=>x.command.startsWith('/sessions ')).map(x=>x.label),Array.from({length:8},(_,i)=>`${i+1}. project-${i+1}`));
+  assert.ok(visibleText(first).includes(join(f.root,'workspaces','project-1')));
+  assert.ok(visibleText(first).includes('1. project-1'));
+  assert.ok(buttons.some(x=>x.command==='/dir-page 8'));
+  await send(f,'dirs-last','/dir-page 16');
+  const last=selectionButtons(f.lark.sent.at(-1)!.body);
+  assert.deepEqual(last.filter(x=>x.command.startsWith('/sessions ')),[{label:'17. project-17',command:`/sessions ${join(f.root,'workspaces','project-17')}`}]);
+  assert.ok(last.some(x=>x.command==='/dir-page 8'));
+  assert.equal(f.codex.calls.some(x=>x.method!=='thread/list'),false);
+});
+
+test('session cards globally sort and deduplicate before paging, show latest prompts and keep exact selection targets', async t => {
+  const f=fixture(t);f.codex.threads.clear();
+  const rows:Thread[]=Array.from({length:10},(_,i)=>({
+    id:`listed-session-${i}`,cwd:f.cwd,name:`会话标题${i}`,updatedAt:100-i,
+    status:{type:i<2?'notLoaded':i<7?'idle':'active'},
+    preview:`首条旧提示${i}`,
+    turns:[{id:`turn-${i}`,items:[
+      {id:`first-input-${i}`,type:'userMessage',content:[{type:'text',text:`更早输入${i}`}]},
+      {id:`steer-input-${i}`,type:'userMessage',content:[{type:'text',text:`最后追加的提示${i}`}]}]}],
+  }));
+  for(const row of rows)f.codex.threads.set(row.id,row);
+  const request=f.codex.request.bind(f.codex);
+  f.codex.request=async<T=any>(method:string,params:any={}):Promise<T>=>{
+    if(method==='thread/list') {
+      f.codex.calls.push({method,params});
+      return (params.cursor?{data:[rows[6],...rows.slice(7)],nextCursor:null}:{data:rows.slice(0,7),nextCursor:'second-page'}) as T;
+    }
+    return request<T>(method,params);
+  };
+  await send(f,'sessions-first','/sessions');
+  const first=f.lark.sent.at(-1)!.body,buttons=selectionButtons(first);
+  assert.deepEqual(buttons.filter(x=>x.command.startsWith('/select ')).map(x=>x.command),[7,8,9,2,3,4,5,6].map(i=>`/select listed-session-${i}`));
+  assert.equal(buttons[0]!.label,'1. 会话标题7');
+  const shown=visibleText(first);
+  assert.ok(shown.includes('最后追加的提示7'));
+  assert.ok(!shown.includes('首条旧提示')&&!shown.includes('更早输入'));
+  assert.ok(!shown.includes(f.cwd)&&!shown.includes('listed-session-'));
+  assert.ok(shown.includes('共 10 个会话'));
+  const inspected=f.codex.calls.filter(x=>x.method==='thread/items/list').map(x=>x.params.threadId);
+  assert.equal(inspected.length,8);assert.ok(!inspected.includes(rows[0]!.id));
+  await send(f,'sessions-next',`/page 8 ${f.cwd}`);
+  const next=selectionButtons(f.lark.sent.at(-1)!.body);
+  assert.deepEqual(next.filter(x=>x.command.startsWith('/select ')).map(x=>x.label),['9. 会话标题0','10. 会话标题1']);
+  assert.ok(next.some(x=>x.command===`/page 0 ${f.cwd}`));
+  assert.ok(f.codex.calls.every(x=>['thread/list','thread/items/list'].includes(x.method)));
+  assert.equal(f.store.bindings().length,0);
+});
+
+test('one unavailable prompt does not prevent selecting other sessions or substitute first-message previews', async t => {
+  const f=fixture(t);f.thread.preview='FIRST_MESSAGE_MUST_NOT_BE_LABELLED_LATEST';
+  const request=f.codex.request.bind(f.codex);
+  f.codex.request=async(method,params:any={})=>{
+    if(method==='thread/items/list'&&params.threadId===f.thread.id)throw new Error('temporary history read failure');
+    return request(method,params);
+  };
+  await send(f,'preview-unavailable','/sessions');
+  const body=f.lark.sent.at(-1)!.body;
+  assert.equal(selectionButtons(body).filter(x=>x.command.startsWith('/select ')).length,2);
+  assert.ok(visibleText(body).includes('暂时无法读取最近提示词'));
+  assert.ok(!visibleText(body).includes(f.thread.preview));
+  assert.equal(f.codex.calls.some(x=>['thread/read','thread/resume'].includes(x.method)),false);
+});
 
 function requestApproval(f: ReturnType<typeof fixture>, id: string | number = 'approval-123') {
   f.codex.emit('serverRequest', {

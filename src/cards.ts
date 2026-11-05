@@ -6,6 +6,31 @@ export type CardAction = {
   type?: 'primary' | 'default' | 'danger';
 };
 
+export type DirectoryEntry = { index: number; path: string };
+export type SessionEntry = { index: number; id: string; title: string; status: string; prompt?: string };
+export type SelectionCardOptions = { navigation?: CardAction[]; notice?: string };
+
+function actionRow(actions: CardAction[]): Record<string, unknown> {
+  return {
+    tag: 'column_set',
+    flex_mode: 'none',
+    columns: actions.map((action) => ({
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: action.label },
+        type: action.type || 'default',
+        width: 'fill',
+        behaviors: [{ type: 'callback', value: { command: action.command } }],
+        // Historical attribute retained for clients that predate behaviors.
+        value: { command: action.command },
+      }],
+    })),
+  };
+}
+
 /** Build a Feishu JSON 2.0 card. Authorization belongs in the callback handler. */
 export function card(
   title: string,
@@ -19,26 +44,75 @@ export function card(
   };
   // Three buttons per row keep session navigation usable on a phone.
   for (let offset = 0; offset < actions.length; offset += 3) {
-    result.elements.push({
-      tag: 'column_set',
-      flex_mode: 'none',
-      columns: actions.slice(offset, offset + 3).map((action) => ({
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: action.label },
-          type: action.type || 'default',
-          width: 'fill',
-          behaviors: [{ type: 'callback', value: { command: action.command } }],
-          // Historical attribute retained for clients that predate behaviors.
-          value: { command: action.command },
-        }],
-      })),
-    });
+    result.elements.push(actionRow(actions.slice(offset, offset + 3)));
   }
   return toCardKit2(result);
+}
+
+const singleLine = (value: string): string => value.replace(/\s+/gu, ' ').trim();
+const excerpt = (value: string, limit: number): string => {
+  const points = Array.from(singleLine(value));
+  return points.length > limit ? points.slice(0, limit - 1).join('') + '…' : points.join('');
+};
+
+// Feishu Markdown requires HTML entities for literal control characters. Using
+// entities also prevents a title from injecting tags, mentions, or links.
+const literalMarkdown = (value: string): string => value.replace(/[&<>~\-!*\/\\[\]()#:+"'`$_{}|.]/g,
+  character => `&#${character.codePointAt(0)};`);
+
+function secondaryText(content: string): Record<string, unknown> {
+  return {
+    tag: 'div',
+    text: { tag: 'plain_text', content, text_size: 'notation', text_color: 'grey' },
+    margin: '0px 0px 0px 0px',
+  };
+}
+
+function selectionCard(title: string, summary: string, elements: Record<string, unknown>[], options: SelectionCardOptions): Record<string, unknown> {
+  const result = card(title, summary);
+  if (options.notice) elements.push(secondaryText(options.notice));
+  const navigation = options.navigation || [];
+  for (let offset = 0; offset < navigation.length; offset += 3) elements.push(actionRow(navigation.slice(offset, offset + 3)));
+  result.body = { direction: 'vertical', padding: '12px 12px 12px 12px', vertical_spacing: '4px', elements };
+  return result;
+}
+
+/** Numbered leaf names with complete paths and an adjacent full-width choice. */
+export function directoryCard(title: string, entries: DirectoryEntry[], options: SelectionCardOptions = {}): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = [];
+  const labels: string[] = [];
+  for (const entry of entries) {
+    const leaf = entry.path.split('/').filter(Boolean).at(-1) || '/';
+    const label = `${entry.index}. ${excerpt(leaf, 60) || '未命名目录'}`;
+    labels.push(label);
+    elements.push(
+      { tag: 'markdown', content: `**${literalMarkdown(label)}**`, text_size: 'normal', margin: '0px 0px 0px 0px' },
+      secondaryText(entry.path),
+      { ...actionRow([{ label, command: `/sessions ${entry.path}` }]), margin: '0px 0px 8px 0px' },
+    );
+  }
+  if (!entries.length) elements.push(secondaryText('暂无可见目录'));
+  return selectionCard(title, labels.join(' · ') || '暂无可见目录', elements, options);
+}
+
+/** Session IDs stay in callback values; only titles, status, and prompt excerpts are visible. */
+export function sessionCard(title: string, entries: SessionEntry[], options: SelectionCardOptions = {}): Record<string, unknown> {
+  const elements: Record<string, unknown>[] = [];
+  const labels: string[] = [];
+  for (const entry of entries) {
+    const label = `${entry.index}. ${excerpt(entry.title || '未命名会话', 60) || '未命名会话'}`;
+    const status = singleLine(entry.status) || '未知';
+    const color = status === 'active' ? 'green' : 'grey';
+    const prompt = excerpt(entry.prompt || '', 80);
+    labels.push(label);
+    elements.push(
+      { tag: 'markdown', content: `<font color='${color}'>**${literalMarkdown(label)}**</font>  <font color='grey'>${literalMarkdown(status)}</font>`, text_size: 'normal', margin: '0px 0px 0px 0px' },
+      secondaryText(prompt ? `最近提示：${prompt}` : '暂无可用提示词'),
+      { ...actionRow([{ label, command: `/select ${entry.id}` }]), margin: '0px 0px 8px 0px' },
+    );
+  }
+  if (!entries.length) elements.push(secondaryText('暂无可见会话'));
+  return selectionCard(title, labels.join(' · ') || '暂无可见会话', elements, options);
 }
 
 type Fence = { marker: string; opener: string };

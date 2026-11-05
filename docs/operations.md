@@ -113,6 +113,18 @@ API 当作同一接口。原菜单如果存在，应先保存可恢复的配置�
 进展快照；同一事件重投只发送一次。后台仍原位更新原状态卡片，避免轮询刷屏。
 “更多操作”的中断入口需确认具体会话和轮次，旧确认卡片不能停止后续新轮次。
 
+目录和会话选择均每页显示 8 项，提供上一页、下一页；条目旁的全宽按钮使用与
+标题相同的“序号＋名称”，避免手机端三列按钮把名称截成相同开头。目录以末级
+名称为标题，完整路径作为次级信息。会话先去重，再按 active、idle、notLoaded
+排序，同一状态按最近更新时间排序；active 标题为绿色，其他状态为灰色。
+会话卡片展示最近一条用户输入的开头，不重复显示目录或会话 ID。
+
+最近提示词通过只读历史分页取得，优先从 `thread/items/list` 倒序查找，包括
+同一轮中后来追加的输入；`thread.preview` 通常是首条输入，不能替代最近提示词。
+仅为当前页读取摘要，限制并发和总耗时。图片消息使用占位说明，读取失败则明确
+提示暂不可用。列目录、列会话和读取摘要不会恢复、订阅或中断这些 session；
+真实路径和会话 ID 仍保存在按钮回调中，用于精确选择。
+
 官方参考：[菜单使用指南](https://open.feishu.cn/document/client-docs/bot-v3/bot-customized-menu)、
 [个性化菜单 API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/bot-v3/bot_menu/set_bot_menu)、
 [菜单事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/application-v6/bot/events/menu)。

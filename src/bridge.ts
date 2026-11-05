@@ -2,7 +2,8 @@ import { EventEmitter } from 'node:events';
 import { randomBytes } from 'node:crypto';
 import { allowedPath, type Config } from './config.js';
 import { Store, stableId, type Binding, type Inbox } from './store.js';
-import { card, latestMarkdown, splitMarkdown, type CardAction } from './cards.js';
+import { card, directoryCard, sessionCard, latestMarkdown, splitMarkdown, type CardAction } from './cards.js';
+import { orderedSessions, uniqueSessions, RecentPromptReader } from './session-preview.js';
 
 export interface CodexPort extends EventEmitter {
   request<T=any>(method:string,params?:unknown):Promise<T>;
@@ -34,8 +35,10 @@ export class Bridge {
   private generation = randomBytes(12).toString('hex');
   private liveRequests = new Map<string,string|number>();
   private historyPagination: 'unknown'|'supported'|'unsupported' = 'unknown';
+  private readonly previews: RecentPromptReader;
   private timer?:NodeJS.Timeout;
   constructor(readonly config:Config,readonly store:Store,readonly codex:CodexPort,readonly lark:LarkPort) {
+    this.previews = new RecentPromptReader((method, params) => codex.request(method, params));
     codex.on('notification',(m:string,p:any)=>this.notification(m,p));
     codex.on('serverRequest',(r:any)=>this.serverRequest(r));
     codex.on('disconnect',()=> {
@@ -116,10 +119,16 @@ export class Bridge {
       return;
     }
     if(command==='/health') { this.reply(e,'服务状态','```json\n'+JSON.stringify({host:this.config.host,codex:this.codex.health(),lark:this.lark.health(),state:this.store.health()},null,2)+'\n```'); return; }
-    if(command==='/dirs') {
+    if(command==='/dirs'||command==='/dir-page') {
+      const offset=command==='/dir-page'&&/^\d+$/.test(arg)?Number(arg):0;
+      if(command==='/dir-page'&&(!/^\d+$/.test(arg)||!Number.isSafeInteger(offset)||offset>1000))throw new Error('目录页码无效，请重新选择目录');
       const {threads,truncated}=await this.list();
       const dirs=[...new Set(threads.map(t=>t.cwd))];
-      this.reply(e,'目录',dirs.map(p=>`- ${p}`).join('\n')+(truncated?'\n\n只扫描了最近 1000 条会话，可用 /sessions 完整目录 直接筛选。':''),dirs.slice(0,15).map((p,i)=>({label:`${i+1}. ${p.split('/').filter(Boolean).slice(-2).join('/')}`,command:`/sessions ${p}`})));
+      const page=dirs.slice(offset,offset+8),navigation:CardAction[]=[];
+      if(offset>0)navigation.push({label:'上一页',command:`/dir-page ${Math.max(0,offset-8)}`});
+      if(offset+8<dirs.length)navigation.push({label:'下一页',command:`/dir-page ${offset+8}`});
+      const notice=`共 ${dirs.length} 个目录`+(truncated?' · 当前仅扫描最近 1000 条会话，可用 /sessions 完整目录 直接筛选。':'');
+      this.store.putCard(`reply:${e.id}:0`,e.chat,directoryCard(`${this.config.host} · 选择目录`,page.map((path,i)=>({index:offset+i+1,path})),{navigation,notice}));
       return;
     }
     if(command==='/sessions'||command==='/page') {
@@ -127,12 +136,23 @@ export class Bridge {
       const offset=match?Number(match[1]):0, cwd=match?(match[2]??''):arg;
       if(command==='/page'&&!match) throw new Error('格式：/page 8 /完整目录');
       if(cwd&&!allowedPath(cwd,this.config.allowedRoots)) throw new Error('该目录不在授权范围内或不存在');
-      if(offset>1000) throw new Error('分页超出范围，请按目录筛选');
-      const {threads,truncated}=await this.list(cwd||undefined);
+      if(!Number.isSafeInteger(offset)||offset>1000) throw new Error('分页超出范围，请按目录筛选');
+      const result=await this.list(cwd||undefined),threads=orderedSessions(result.threads),truncated=result.truncated;
       const page=threads.slice(offset,offset+8);
-      const actions:CardAction[]=page.map((t,i)=>({label:`${i+offset+1}. ${(t.name||t.preview||t.id).slice(0,40)}`,command:`/select ${t.id}`}));
-      if(offset+8<threads.length) actions.push({label:'下一页',command:`/page ${offset+8}${cwd?' '+cwd:''}`});
-      this.reply(e,'选择会话',page.map(t=>`**${textId(t.name||t.preview||'未命名会话')}**\n目录：${t.cwd}\nID：\`${t.id}\`\n状态：${t.status?.type??'未知'}`).join('\n\n')+(page.length?'':'暂无可见会话')+(truncated?'\n\n列表已截断，请按目录筛选。':''),actions);
+      const navigation:CardAction[]=[];
+      if(offset>0)navigation.push({label:'上一页',command:`/page ${Math.max(0,offset-8)}${cwd?' '+cwd:''}`});
+      if(offset+8<threads.length)navigation.push({label:'下一页',command:`/page ${offset+8}${cwd?' '+cwd:''}`});
+      // Only inspect the visible page, with bounded parallel reads and one shared
+      // time budget. Navigation never resumes or subscribes to a listed session.
+      const prompts:(string|undefined)[]=new Array(page.length),deadline=Date.now()+8_000;
+      let next=0;
+      await Promise.all(Array.from({length:Math.min(3,page.length)},async()=>{
+        for(let index=next++;index<page.length;index=next++)prompts[index]=await this.previews.read(page[index]!.id,deadline);
+      }));
+      const notice=`共 ${threads.length} 个会话 · active → idle → notLoaded`+(truncated?' · 列表已截断，可按目录筛选。':'');
+      this.store.putCard(`reply:${e.id}:0`,e.chat,sessionCard(`${this.config.host} · 选择会话`,page.map((t,i)=>({
+        index:offset+i+1,id:t.id,title:t.name||t.preview||'未命名会话',status:t.status?.type??'未知',prompt:prompts[i],
+      })),{navigation,notice}));
       return;
     }
     if(command==='/select') {
@@ -199,13 +219,15 @@ export class Bridge {
   }
   private checkThread(t:Thread) { if(!t?.id||!allowedPath(t.cwd,this.config.allowedRoots)) throw new Error('该会话的工作目录不在授权范围内或不存在'); }
   private async list(cwd?:string):Promise<{threads:Thread[];truncated:boolean}> {
-    const threads:Thread[]=[];let cursor:string|undefined;
+    const threads:Thread[]=[],seen=new Set<string>();let cursor:string|undefined;
     for(let page=0;page<10;page++) {
       const r=await this.codex.request('thread/list',{limit:100,sortKey:'updated_at',sortDirection:'desc',modelProviders:[],sourceKinds:['cli','vscode','appServer','exec'],...(cwd?{cwd}:{}),...(cursor?{cursor}:{})});
       threads.push(...(r.data as Thread[]).filter(t=>allowedPath(t.cwd,this.config.allowedRoots)));
-      cursor=r.nextCursor??undefined;if(!cursor)return {threads,truncated:false};
+      cursor=r.nextCursor??undefined;if(!cursor)return {threads:uniqueSessions(threads),truncated:false};
+      if(seen.has(cursor))return {threads:uniqueSessions(threads),truncated:true};
+      seen.add(cursor);
     }
-    return {threads,truncated:true};
+    return {threads:uniqueSessions(threads),truncated:true};
   }
   private async read(id:string):Promise<Thread> {
     const {thread}=await this.codex.request<{thread:Thread}>('thread/read',{threadId:id});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { card, latestMarkdown, splitMarkdown } from '../src/cards.js';
+import { card, directoryCard, sessionCard, latestMarkdown, splitMarkdown } from '../src/cards.js';
 
 test('card uses schema 2.0, source Markdown, and explicit callback commands', () => {
   const markdown = '## 最新进展\n\n```ts\nconst value = 1;\n```';
@@ -28,6 +28,90 @@ test('navigation buttons wrap to three per row without losing commands', () => {
   assert.equal(elements[0].content, '（暂无内容）');
   assert.deepEqual(elements.slice(1).map((x) => x.columns.length), [3, 3, 2]);
   assert.equal((value.header as any).title.content, 'Codex');
+});
+
+test('directory choices pair numbered leaf titles with full paths and full-width callbacks', () => {
+  const paths = ['/mnt/shared/code/MTDP/', '/root/other/MTDP', '/'];
+  const value = directoryCard('dev-a · 目录', paths.map((path, i) => ({ index: i + 9, path })));
+  const elements = (value.body as { elements: any[] }).elements;
+  assert.equal(value.schema, '2.0');
+  assert.equal(elements.length, 9);
+  paths.forEach((path, i) => {
+    const [heading, detail, row] = elements.slice(i * 3, i * 3 + 3);
+    assert.equal(heading.tag, 'markdown');
+    assert.equal(detail.text.tag, 'plain_text');
+    assert.equal(detail.text.content, path);
+    assert.equal(detail.text.text_size, 'notation');
+    assert.equal(detail.text.text_color, 'grey');
+    assert.equal(row.columns.length, 1);
+    const button = row.columns[0].elements[0];
+    assert.equal(button.text.content, `${i + 9}. ${i < 2 ? 'MTDP' : '/'}`);
+    assert.equal(button.width, 'fill');
+    assert.deepEqual(button.behaviors, [{ type: 'callback', value: { command: `/sessions ${path}` } }]);
+  });
+  assert.equal((value.body as any).vertical_spacing, '4px');
+});
+
+test('session choices show status-colored titles and prompt excerpts with IDs only in callbacks', () => {
+  const entries = ['active', 'idle', 'notLoaded'].map((status, i) => ({
+    index: i + 1, id: `private-session-${i}`, title: `会话标题 ${i}`, status,
+    prompt: '请检查最近一次提交\n\t 并整理结果。' + '尾部内容'.repeat(100),
+  }));
+  const value = sessionCard('dev-b · 选择会话', entries);
+  const elements = (value.body as { elements: any[] }).elements;
+  entries.forEach((entry, i) => {
+    const [heading, detail, row] = elements.slice(i * 3, i * 3 + 3);
+    assert.ok(heading.content.startsWith(`<font color='${i === 0 ? 'green' : 'grey'}'>`));
+    assert.ok(heading.content.includes(entry.status));
+    assert.equal(detail.text.tag, 'plain_text');
+    assert.ok(detail.text.content.startsWith('最近提示：请检查最近一次提交 并整理结果。'));
+    assert.ok(detail.text.content.endsWith('…'));
+    assert.ok(!detail.text.content.includes('\n'));
+    assert.ok(!heading.content.includes(entry.id));
+    assert.ok(!detail.text.content.includes(entry.id));
+    assert.ok(!detail.text.content.includes('目录：'));
+    assert.equal(row.columns.length, 1);
+    const button = row.columns[0].elements[0];
+    assert.equal(button.text.content, `${i + 1}. 会话标题 ${i}`);
+    assert.deepEqual(button.value, { command: `/select ${entry.id}` });
+  });
+});
+
+test('selection titles cannot inject Markdown actions or override status colors', () => {
+  const hostile = "**[link](https://x)** <at id=all></at> <font color='red'>";
+  const value = sessionCard('选择会话', [{ index: 1, id: 'session-one', title: hostile, status: 'idle', prompt: hostile }]);
+  const elements = (value.body as { elements: any[] }).elements;
+  assert.ok(elements[0].content.startsWith("<font color='grey'>"));
+  assert.ok(!elements[0].content.includes('<at'));
+  assert.ok(!elements[0].content.includes("color='red'"));
+  assert.ok(!elements[0].content.includes('[link]'));
+  assert.ok(elements[0].content.includes('&#60;at'));
+  assert.ok(elements[0].content.includes('&#42;'));
+  assert.equal(elements[1].text.tag, 'plain_text');
+  assert.equal(elements[1].text.content, '最近提示：' + hostile);
+  const notice = "<at id=all></at> **只是说明**";
+  const empty = directoryCard('目录', [], { notice, navigation: [{ label: '下一页', command: '/dir-page 8' }] });
+  const emptyElements = (empty.body as { elements: any[] }).elements;
+  assert.equal(emptyElements[0].text.content, '暂无可见目录');
+  assert.equal(emptyElements[1].text.tag, 'plain_text');
+  assert.equal(emptyElements[1].text.content, notice);
+  assert.equal(emptyElements[2].columns[0].elements[0].value.command, '/dir-page 8');
+});
+
+test('selection truncation preserves Unicode and keeps navigation indices and unnamed fallbacks', () => {
+  const value = sessionCard('会话', [
+    { index: 9, id: 'unicode', title: '🙂'.repeat(100), status: 'active', prompt: '汉🙂'.repeat(100) },
+    { index: 10, id: 'empty', title: '  ', status: 'idle', prompt: '\n\t' },
+  ], { navigation: [{ label: '上一页', command: '/page 0' }, { label: '下一页', command: '/page 16' }] });
+  const elements = (value.body as { elements: any[] }).elements;
+  const label = elements[2].columns[0].elements[0].text.content;
+  assert.equal(label, '9. ' + '🙂'.repeat(59) + '…');
+  assert.equal(Array.from(elements[1].text.content.slice('最近提示：'.length)).length, 80);
+  assert.ok(!JSON.stringify(value).includes('\\ud83d'));
+  assert.equal(elements[5].columns[0].elements[0].text.content, '10. 未命名会话');
+  assert.equal(elements[4].text.content, '暂无可用提示词');
+  assert.equal(elements[6].columns.length, 2);
+  assert.deepEqual(elements[6].columns.map((c: any) => c.elements[0].value.command), ['/page 0', '/page 16']);
 });
 
 test('plain prose splits by UTF-8 bytes without losing text or damaging Unicode', () => {
