@@ -7,7 +7,7 @@ import { setImmediate as immediate } from 'node:timers/promises';
 import test, { type TestContext } from 'node:test';
 import { Bridge, type CodexPort, type LarkPort, type Thread } from '../src/bridge.js';
 import { allowedPath, type Config } from '../src/config.js';
-import { Store } from '../src/store.js';
+import { Store, stableId } from '../src/store.js';
 
 class FakeCodex extends EventEmitter implements CodexPort {
   calls: { method: string; params: any }[] = [];
@@ -304,7 +304,7 @@ test('an old session card cannot interrupt the newly selected session', async (t
   f.store.bind('chat-a', 'ou_owner', f.thread.id, f.cwd);
   await f.bridge.refresh(f.store.binding('chat-a', 'ou_owner')!, true);
   await f.bridge.flush();
-  assert.ok(JSON.stringify(f.lark.sent[0]?.body).includes(`/interrupt ${f.thread.id}`));
+  assert.ok(JSON.stringify(f.lark.sent[0]?.body).includes(`/interrupt-confirm ${f.thread.id}`));
   f.store.bind('chat-a', 'ou_owner', second.id, second.cwd);
   f.bridge.receive({ id: 'old-interrupt', chatId: 'chat-a', userId: 'ou_owner',
     kind: 'action', messageId: 'receipt-1', text: `/interrupt ${f.thread.id}` });
@@ -313,6 +313,148 @@ test('an old session card cannot interrupt the newly selected session', async (t
   await send(f, 'current-interrupt', '/interrupt');
   const interruption = f.codex.calls.filter((x) => x.method === 'turn/interrupt');
   assert.deepEqual(interruption.map((x) => x.params), [{ threadId: second.id, turnId: 'turn-b' }]);
+});
+
+test('each manual progress request sends a new bottom message and duplicate events reuse it', async (t) => {
+  const f=fixture(t);
+  const turn={id:'active-turn',status:'inProgress',items:[{id:'reply',type:'agentMessage',text:'当前进展'}]};
+  f.thread.status={type:'active'};f.thread.turns=[turn];
+  f.store.bind('oc_owner','ou_owner',f.thread.id,f.cwd);
+  await f.bridge.refresh(f.store.binding('oc_owner','ou_owner')!,true);await f.bridge.flush();
+  assert.equal(f.lark.sent.length,1);
+  const event={id:'menu-status-1',chatId:'',userId:'ou_owner',text:'/status',kind:'menu'};
+  f.bridge.receive(event);
+  assert.equal(await settled(f.store,event.id),'done');
+  assert.equal(f.lark.sent.length,2);
+  const snapshot=f.store.db.prepare('SELECT message,content FROM outbox WHERE key=?').get('oc_owner:reply:menu-status-1:0');
+  assert.equal(snapshot?.message,'receipt-2');
+  assert.ok(String(snapshot?.content).includes('当前进展'));
+  f.bridge.receive(event);await f.bridge.tick();
+  assert.equal(f.lark.sent.length,2);
+  assert.equal(await send(f,'typed-status-2','/status','oc_owner'),'done');
+  assert.equal(f.lark.sent.length,3);
+  turn.items[0]!.text='随后继续的进展';
+  await f.bridge.poll();await f.bridge.flush();
+  assert.equal(f.lark.sent.length,3);
+  assert.ok(f.lark.updates.some(x=>x.message==='receipt-1'&&JSON.stringify(x.body).includes('随后继续的进展')));
+  assert.equal(f.codex.calls.some(x=>['turn/start','turn/steer','turn/interrupt'].includes(x.method)),false);
+});
+
+test('menu routing accepts only the four fixed commands and still checks the user allowlist', async (t) => {
+  const f=fixture(t);
+  f.store.rememberDirectChat('ou_owner','oc_owner');
+  for(const [id,text,user] of [
+    ['menu-task','执行新的任务','ou_owner'],['menu-interrupt','/interrupt','ou_owner'],
+    ['menu-argument','/sessions /somewhere','ou_owner'],['menu-intruder','/dirs','ou_intruder'],
+  ]) {
+    f.bridge.receive({id:id!,text:text!,userId:user!,chatId:'chat-a',kind:'menu'});
+    assert.equal(f.store.db.prepare('SELECT id FROM inbox WHERE id=?').get(id!),undefined);
+  }
+  for(const [index,text] of ['/dirs','/sessions','/status','/more'].entries()) {
+    const id='valid-menu-'+index;
+    f.bridge.receive({id,text,userId:'ou_owner',chatId:'chat-a',kind:'menu'});
+    assert.equal(await settled(f.store,id),'done');
+  }
+  f.store.ingest({id:'persisted-menu-task',text:'执行任务',userId:'ou_owner',chatId:'chat-a',kind:'menu'});
+  await f.bridge.drain();
+  assert.equal(await settled(f.store,'persisted-menu-task'),'rejected');
+  assert.equal(f.codex.calls.some(x=>['thread/resume','turn/start','turn/steer','turn/interrupt'].includes(x.method)),false);
+});
+
+test('a first menu click establishes and persists p2p routing with a stable welcome identity', async (t) => {
+  const f=fixture(t);
+  const welcomes:{user:string;key:string}[]=[];
+  (f.lark as LarkPort).ensureDirectChat=async(user,key)=>{welcomes.push({user,key});return 'oc_owner';};
+  const event={id:'first-menu',chatId:'oc_untrusted_payload',userId:'ou_owner',text:'/more',kind:'menu'};
+  f.bridge.receive(event);assert.equal(await settled(f.store,event.id),'done');
+  assert.deepEqual(welcomes,[{user:'ou_owner',key:stableId('menu-p2p:first-menu')}]);
+  assert.equal(f.store.directChat('ou_owner'),'oc_owner');
+  assert.equal(f.store.db.prepare('SELECT chat FROM inbox WHERE id=?').get(event.id)?.chat,'oc_owner');
+  assert.ok(f.lark.sent.every(x=>x.chat==='oc_owner'));
+  f.bridge.receive(event);await f.bridge.tick();
+  f.bridge.receive({...event,id:'second-menu',chatId:''});assert.equal(await settled(f.store,'second-menu'),'done');
+  assert.equal(welcomes.length,1);
+  assert.equal(f.codex.calls.some(x=>['thread/resume','turn/start','turn/steer','turn/interrupt'].includes(x.method)),false);
+});
+
+test('authenticated p2p ingress keeps menu routing available after unbinding', async (t) => {
+  const f=fixture(t);
+  f.bridge.receive({id:'known-p2p',chatId:'oc_owner',userId:'ou_owner',text:'/help',kind:'message'});
+  assert.equal(await settled(f.store,'known-p2p'),'done');
+  f.store.bind('oc_owner','ou_owner',f.thread.id,f.cwd);
+  assert.equal(await send(f,'unbind-known','/unbind','oc_owner'),'done');
+  f.bridge.receive({id:'after-unbind',chatId:'',userId:'ou_owner',text:'/dirs',kind:'menu'});
+  assert.equal(await settled(f.store,'after-unbind'),'done');
+  assert.equal(f.store.db.prepare('SELECT chat FROM inbox WHERE id=?').get('after-unbind')?.chat,'oc_owner');
+  assert.equal(f.store.binding('oc_owner','ou_owner'),undefined);
+});
+
+test('unknown menu actors and forwarded receipts cannot seed the p2p map or send a welcome', async (t) => {
+  const f=fixture(t);let welcomes=0;
+  (f.lark as LarkPort).ensureDirectChat=async()=>{welcomes++;return 'oc_owner';};
+  f.bridge.receive({id:'unknown-menu',chatId:'',userId:'ou_intruder',text:'/more',kind:'menu'});
+  f.bridge.receive({id:'unknown-p2p',chatId:'oc_attacker',userId:'ou_intruder',text:'/help',kind:'message'});
+  f.bridge.receive({id:'forwarded-card',chatId:'oc_forwarded',userId:'ou_owner',text:'/help',kind:'action',messageId:'unknown-receipt'});
+  await immediate();
+  assert.equal(welcomes,0);assert.equal(f.store.directChat('ou_owner'),undefined);assert.equal(f.store.directChat('ou_intruder'),undefined);
+  assert.equal(f.lark.sent.length,0);
+});
+
+test('unresolved p2p routing fails without sending to an empty chat and a fresh click can retry', async (t) => {
+  const f=fixture(t);const welcomeKeys:string[]=[];let failing=true;
+  (f.lark as LarkPort).ensureDirectChat=async(_user,key)=>{welcomeKeys.push(key);if(failing)throw new Error('Welcome receipt unavailable');return 'oc_owner';};
+  const event={id:'welcome-lost',chatId:'oc_untrusted_payload',userId:'ou_owner',text:'/more',kind:'menu'};
+  f.bridge.receive(event);assert.equal(await settled(f.store,event.id),'failed');
+  assert.equal(f.lark.sent.length,0);assert.equal(f.store.health().unsent,0);
+  assert.equal(f.store.db.prepare('SELECT chat FROM inbox WHERE id=?').get(event.id)?.chat,'');
+  f.bridge.receive(event);await f.bridge.tick();assert.equal(welcomeKeys.length,1);
+  failing=false;
+  f.bridge.receive({...event,id:'welcome-retry'});assert.equal(await settled(f.store,'welcome-retry'),'done');
+  assert.deepEqual(welcomeKeys,[stableId('menu-p2p:welcome-lost'),stableId('menu-p2p:welcome-retry')]);
+  assert.ok(f.lark.sent.every(x=>x.chat==='oc_owner'));
+});
+
+test('recovered menu bootstrap reuses its identity inside the dedup window and expires afterward', async (t) => {
+  const f=fixture(t);const welcomeKeys:string[]=[];
+  (f.lark as LarkPort).ensureDirectChat=async(_user,key)=>{welcomeKeys.push(key);return 'oc_owner';};
+  for(const id of ['recovered-menu','expired-menu']) {
+    f.store.ingest({id,chatId:'',userId:'ou_owner',text:'/more',kind:'menu'});f.store.mark(id,'processing');
+  }
+  f.store.db.prepare('UPDATE inbox SET created=? WHERE id=?').run(Date.now()-51*60_000,'expired-menu');
+  // Resolve the expired event first, while no remembered p2p route exists.
+  f.store.db.prepare('UPDATE inbox SET created=? WHERE id=?').run(Date.now()-52*60_000,'expired-menu');
+  f.store.recover();await f.bridge.drain();
+  assert.equal(await settled(f.store,'expired-menu'),'failed');
+  assert.equal(await settled(f.store,'recovered-menu'),'done');
+  assert.deepEqual(welcomeKeys,[stableId('menu-p2p:recovered-menu')]);
+  assert.equal(f.store.db.prepare('SELECT chat FROM inbox WHERE id=?').get('recovered-menu')?.chat,'oc_owner');
+});
+
+test('more operations asks for interrupt confirmation pinned to the selected session and turn', async (t) => {
+  const f=fixture(t);
+  f.thread.status={type:'active'};f.thread.turns=[{id:'running-turn',status:'inProgress'}];
+  f.store.bind('chat-a','ou_owner',f.thread.id,f.cwd);
+  assert.equal(await send(f,'more-1','/more'),'done');
+  const more=JSON.stringify(f.lark.sent[0]?.body);
+  for(const command of ['/health','/help',`/unbind ${f.thread.id}`,`/interrupt-confirm ${f.thread.id}`])assert.ok(more.includes(command));
+  assert.equal(f.codex.calls.length,0);
+  assert.equal(await send(f,'confirm-1',`/interrupt-confirm ${f.thread.id}`),'done');
+  assert.equal(f.codex.calls.some(x=>x.method==='turn/interrupt'),false);
+  assert.ok(JSON.stringify(f.lark.sent.at(-1)?.body).includes(`/interrupt ${f.thread.id} running-turn`));
+  assert.equal(await send(f,'interrupt-1',`/interrupt ${f.thread.id} running-turn`),'done');
+  assert.deepEqual(f.codex.calls.filter(x=>x.method==='turn/interrupt').map(x=>x.params),[{threadId:f.thread.id,turnId:'running-turn'}]);
+});
+
+test('old more-operation cards cannot unbind another session or interrupt a later turn', async (t) => {
+  const f=fixture(t);
+  f.store.bind('chat-a','ou_owner','session-b-123',f.cwd);
+  assert.equal(await send(f,'old-unbind',`/unbind ${f.thread.id}`),'failed');
+  assert.equal(f.store.binding('chat-a','ou_owner')?.thread,'session-b-123');
+  assert.equal(await send(f,'old-confirm',`/interrupt-confirm ${f.thread.id}`),'failed');
+  f.store.bind('chat-a','ou_owner',f.thread.id,f.cwd);
+  f.thread.status={type:'active'};f.thread.turns=[{id:'later-turn',status:'inProgress'}];
+  assert.equal(await send(f,'old-turn',`/interrupt ${f.thread.id} earlier-turn`),'failed');
+  assert.equal(f.codex.calls.some(x=>x.method==='turn/interrupt'),false);
 });
 
 test('send failure retries with the same Feishu UUID and does not busy-loop', async (t) => {

@@ -70,12 +70,52 @@ npm start -- --config /absolute/path/config.local.json
 错误和开放平台为准，不为未来功能批量申请群聊、文件或通讯录权限。
 
 - 事件：`im.message.receive_v1`，长连接模式。
+- 菜单事件：`application.bot.menu_v6`，长连接模式。
 - 回调：`card.action.trigger`，在回调配置中单独订阅。
 - 权限/订阅变更后发布新应用版本，完成组织所需审核，再重新验证。
 
-服务会等待两种消费者都报告 ready。卡片能发出但按钮失效时，先检查回调订阅与
+服务会等待消息和卡片消费者都报告 ready。菜单订阅尚未开通时，保留原有收发，
+菜单消费者每 60 秒重新检查，授权后自动恢复；`lark.ready` 在三种消费者全部
+就绪后才为 true。卡片能发出但按钮失效时，先检查回调订阅与
 发布状态。消息和卡片回调共享 CLI 事件基础设施；不要在本项目排障时停止其他
 应用或已有会话使用的共享 event bus。
+
+### 输入框固定菜单
+
+固定四项：**选择目录、选择会话、最新进展、更多操作**，分别配置推送事件
+`codex_dirs`、`codex_sessions`、`codex_status`、`codex_more`。不要设置成发送
+文字消息。仅允许白名单用户的这四种菜单事件；其他 event key 不会作为模型指令。
+
+开发者后台可在机器人自定义菜单中选择 **悬浮菜单**（飞书 7.22+），发布后生效。
+CLI 创建的应用也可使用 `deploy/bot-menu.example.json`，替换为该应用下实际的
+用户 open_id，通过官方个性化机器人菜单 API 配置仅此用户可见的四项菜单：
+
+```sh
+lark-cli --profile YOUR_PROFILE api POST /open-apis/bot/v3/bot_menu \
+  --as bot --params '{"user_id_type":"open_id"}' --data @bot-menu.local.json
+```
+
+该 API 要求 `application:bot.menu:write`，响应应逐项核对名称和 `event_key`；
+单独 GET 需要 `application:bot.menu:readonly`。个性化接口没有展示样式参数，
+需在手机端确认常驻输入框上方。不要把有不同权限和应用来源限制的 v7 应用管理
+API 当作同一接口。原菜单如果存在，应先保存可恢复的配置。
+
+菜单事件还需要单独订阅。运行 `lark-cli event consume application.bot.menu_v6
+--as bot --timeout 3s` 检查；若提示 `failed_precondition`，使用 CLI 返回的
+官方授权链接为已有应用增量添加该事件。此流程需要应用操作者本人确认；不要
+因此覆盖其他事件或卡片回调。确认后本服务自动重试连接，无需重启 Codex。
+
+菜单事件本身不带 chat_id。服务只从已验证的用户单聊历史恢复映射，或向该允许
+用户发送一次带幂等标识的欢迎消息，从回执取得真实单聊 ID。解绑保留此映射，
+因此之后仍可点击固定菜单。菜单不会创建群聊。
+
+主动点击“最新进展”、输入 `/status` 或点卡片刷新时，在聊天底部发送一张新的
+进展快照；同一事件重投只发送一次。后台仍原位更新原状态卡片，避免轮询刷屏。
+“更多操作”的中断入口需确认具体会话和轮次，旧确认卡片不能停止后续新轮次。
+
+官方参考：[菜单使用指南](https://open.feishu.cn/document/client-docs/bot-v3/bot-customized-menu)、
+[个性化菜单 API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/bot-v3/bot_menu/set_bot_menu)、
+[菜单事件](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/application-v6/bot/events/menu)。
 
 ## 持续运行的两种方式
 

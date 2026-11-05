@@ -1,0 +1,11 @@
+{
+  "user_id": "ou_REPLACE_WITH_YOUR_OPEN_ID",
+  "bot_menu": {
+    "bot_menu_items": [
+      { "name": "选择目录", "i18n_name": { "zh_cn": "选择目录", "en_us": "Directories" }, "tag": "codex_dirs", "behaviors": [{ "type": "event_key", "event_key": "codex_dirs", "is_primary": true }] },
+      { "name": "选择会话", "i18n_name": { "zh_cn": "选择会话", "en_us": "Sessions" }, "tag": "codex_sessions", "behaviors": [{ "type": "event_key", "event_key": "codex_sessions", "is_primary": true }] },
+      { "name": "最新进展", "i18n_name": { "zh_cn": "最新进展", "en_us": "Latest progress" }, "tag": "codex_status", "behaviors": [{ "type": "event_key", "event_key": "codex_status", "is_primary": true }] },
+      { "name": "更多操作", "i18n_name": { "zh_cn": "更多操作", "en_us": "More" }, "tag": "codex_more", "behaviors": [{ "type": "event_key", "event_key": "codex_more", "is_primary": true }] }
+    ]
+  }
+}

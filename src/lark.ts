@@ -6,7 +6,7 @@ export type Inbound = {
   chatId: string;
   userId: string;
   text: string;
-  kind: 'message' | 'action';
+  kind: 'message' | 'action' | 'menu';
   messageId?: string;
 };
 
@@ -15,11 +15,25 @@ const object = (value: unknown): ObjectValue | null =>
   value !== null && typeof value === 'object' && !Array.isArray(value) ? value as ObjectValue : null;
 const nonempty = (value: unknown): string | undefined =>
   typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+const MENU_COMMANDS = new Map([
+  ['codex_dirs', '/dirs'], ['codex_sessions', '/sessions'],
+  ['codex_status', '/status'], ['codex_more', '/more'],
+]);
 
 /** The CLI's processed event schema is flat; content is already plain text. */
 export function normalizeEvent(raw: unknown): Inbound | null {
   const value = object(raw);
   if (!value) return null;
+  if (value.type === 'application.bot.menu_v6') {
+    const id = nonempty(value.event_id);
+    const userId = nonempty(value.operator_open_id) ?? nonempty(value.operator_id);
+    const text = typeof value.event_key === 'string' ? MENU_COMMANDS.get(value.event_key) : undefined;
+    if (!id || !userId || !/^ou_[A-Za-z0-9_-]+$/.test(userId) || !text) return null;
+    if (value.operator_id !== undefined && value.operator_id !== userId) return null;
+    // This event has no chat_id. Never trust an injected destination: the durable
+    // router resolves the authenticated operator's own P2P conversation.
+    return { id, chatId: '', userId, text, kind: 'menu' };
+  }
   const chatId = nonempty(value.chat_id);
   const messageId = nonempty(value.message_id) ?? nonempty(value.id);
   if (!chatId) return null;
@@ -53,6 +67,7 @@ export type LarkCliOptions = {
   restartBaseMs?: number;
   restartMaxMs?: number;
   maxRestarts?: number;
+  configurationRetryMs?: number;
 };
 
 /** Carries structured remediation metadata, never raw stdout/stderr or credentials. */
@@ -90,9 +105,10 @@ type Consumer = {
   lastReadyAt?: number;
   failure?: string;
   permanent: boolean;
+  configurationPending?: boolean;
 };
 
-const EVENT_KEYS = ['im.message.receive_v1', 'card.action.trigger'];
+const EVENT_KEYS = ['im.message.receive_v1', 'card.action.trigger', 'application.bot.menu_v6'];
 const MAX_OUTPUT = 1024 * 1024;
 const cliEnv = () => ({ ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' });
 
@@ -129,7 +145,12 @@ export class LarkCli {
     this.running = true;
     this.onEvent = onEvent;
     for (const consumer of this.consumers) { consumer.failures = 0; consumer.permanent = false; delete consumer.failure; }
-    this.starting = Promise.all(this.consumers.map(consumer => this.launch(consumer)))
+    this.starting = Promise.all(this.consumers.map(consumer => this.launch(consumer).catch(error => {
+      // A newly added menu subscription must not take existing messages/cards
+      // offline while its administrator confirmation is still pending.
+      if (consumer.key === 'application.bot.menu_v6' && error instanceof LarkCliError && error.subtype === 'failed_precondition') return;
+      throw error;
+    })))
       .then(() => undefined)
       .catch(async error => { await this.stop(); throw error; })
       .finally(() => { this.starting = undefined; });
@@ -181,6 +202,8 @@ export class LarkCli {
       if (!settled && stderr.split(/\r?\n/).some(line => line.trim() === `[event] ready event_key=${consumer.key}`)) {
         settled = true;
         consumer.ready = true;
+        if (consumer.configurationPending) consumer.failures = 0;
+        delete consumer.configurationPending;
         consumer.lastReadyAt = Date.now();
         delete consumer.failure;
         clearTimeout(timeout);
@@ -205,6 +228,17 @@ export class LarkCli {
       if (consumer.lastReadyAt && Date.now() - consumer.lastReadyAt > 60_000) consumer.failures = 0;
       consumer.failures += 1;
       consumer.failure = startupTimedOut ? 'Event consumer did not become ready before timeout' : error.message;
+      if (consumer.key === 'application.bot.menu_v6' && error.subtype === 'failed_precondition') {
+        consumer.permanent = false;
+        consumer.failures = 0;
+        if (!consumer.configurationPending) this.logger('lark.menu_subscription_pending', { key: consumer.key });
+        consumer.configurationPending = true;
+        consumer.timer = setTimeout(() => {
+          delete consumer.timer;
+          if (this.running) void this.launch(consumer).catch(() => {});
+        }, this.opts.configurationRetryMs ?? 60_000);
+        return;
+      }
       if (!error.retryable || consumer.permanent || consumer.failures > (this.opts.maxRestarts ?? 8)) {
         consumer.permanent = true;
         this.logger('lark.consumer_stopped', { key: consumer.key, failures: consumer.failures, errorType: error.errorType, subtype: error.subtype });
@@ -294,6 +328,18 @@ export class LarkCli {
     return id;
   }
 
+  /** Only needed before the operator has ever sent this bridge a P2P message. */
+  async ensureDirectChat(userId: string, idempotencyKey: string): Promise<string> {
+    if (!/^ou_[A-Za-z0-9_-]+$/.test(userId) || !idempotencyKey.trim()) throw new Error('A user ID and stable idempotency key are required');
+    const result = object(await this.run('ensureDirectChat', ['im', '+messages-send', '--as', 'bot', '--user-id', userId,
+      '--text', 'Codex 控制台已连接，正在打开菜单。', '--idempotency-key', idempotencyKey, '--json']));
+    const data = object(result?.data);
+    const message = object(result?.message) ?? object(data?.message);
+    const chatId = nonempty(result?.chat_id) ?? nonempty(data?.chat_id) ?? nonempty(message?.chat_id);
+    if (!chatId || !/^oc_[A-Za-z0-9_-]+$/.test(chatId)) throw new Error('Lark ensureDirectChat returned no chat ID receipt');
+    return chatId;
+  }
+
   async updateCard(messageId: string, card: Record<string, unknown>): Promise<void> {
     if (!/^om_[A-Za-z0-9_-]+$/.test(messageId)) throw new Error('Invalid card message ID');
     await this.run('updateCard', ['api', 'PATCH', `/open-apis/im/v1/messages/${messageId}`, '--as', 'bot', '--data', '-'],
@@ -302,6 +348,6 @@ export class LarkCli {
 
   health(): unknown {
     return { running: this.running, ready: this.running && this.consumers.every(c => c.ready),
-      consumers: this.consumers.map(c => ({ key: c.key, ready: c.ready, failures: c.failures, permanent: c.permanent, failure: c.failure })) };
+      consumers: this.consumers.map(c => ({ key: c.key, ready: c.ready, failures: c.failures, permanent: c.permanent, configurationPending: c.configurationPending === true, failure: c.failure })) };
   }
 }

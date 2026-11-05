@@ -51,6 +51,32 @@ test('one thread has one controlling chat and user', (t) => {
   assert.equal(store.binding('chat-b', 'ou_other')?.thread, 'thread-a');
 });
 
+test('direct chat routes persist across reopening and unbinding', t=>{
+  const dir=mkdtempSync(join(tmpdir(),'feishu-p2p-'));t.after(()=>rmSync(dir,{recursive:true,force:true}));
+  const path=join(dir,'state.sqlite');let store=new Store(path);
+  store.rememberDirectChat('ou_owner','oc_owner');store.bind('oc_owner','ou_owner','thread-a','/workspace');
+  store.unbind('oc_owner','ou_owner');store.close();store=new Store(path);t.after(()=>store.close());
+  assert.equal(store.directChat('ou_owner'),'oc_owner');
+  store.rememberDirectChat('ou_owner','oc_new');assert.equal(store.directChat('ou_owner'),'oc_new');
+  assert.throws(()=>store.rememberDirectChat('ou_owner','chat-invalid'));
+});
+
+test('old p2p bindings or ingress can seed routing, while menu destinations and ambiguous chats cannot', t=>{
+  const store=new Store(':memory:');t.after(()=>store.close());
+  store.bind('oc_binding','ou_bound','thread-a','/workspace');assert.equal(store.directChat('ou_bound'),'oc_binding');
+  store.ingest({id:'old-p2p',chatId:'oc_message',userId:'ou_known',text:'/help',kind:'message'});
+  store.ingest({id:'old-card',chatId:'oc_card',userId:'ou_card',text:'/help',kind:'action'});
+  store.ingest({id:'menu-payload',chatId:'oc_untrusted',userId:'ou_new',text:'/more',kind:'menu'});
+  assert.equal(store.directChat('ou_known'),'oc_message');assert.equal(store.directChat('ou_card'),'oc_card');
+  assert.equal(store.directChat('ou_new'),undefined);
+  store.ingest({id:'ambiguous-a',chatId:'oc_a',userId:'ou_ambiguous',text:'/help',kind:'message'});
+  store.ingest({id:'ambiguous-b',chatId:'oc_b',userId:'ou_ambiguous',text:'/help',kind:'message'});
+  assert.equal(store.directChat('ou_ambiguous'),undefined);
+  store.routeMenu('menu-payload','oc_resolved');
+  assert.equal(store.db.prepare('SELECT chat FROM inbox WHERE id=?').get('menu-payload')?.chat,'oc_resolved');
+  assert.throws(()=>store.routeMenu('menu-payload',''));
+});
+
 test('delivery acknowledgement does not drop a newer card version', (t) => {
   const store = new Store(':memory:'); t.after(() => store.close());
   store.putCard('progress', 'chat-a', { text: 'version 1' });

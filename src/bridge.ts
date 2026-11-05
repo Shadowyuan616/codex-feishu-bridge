@@ -12,11 +12,13 @@ export interface CodexPort extends EventEmitter {
 export interface LarkPort {
   sendCard(chat:string,body:Record<string,unknown>,key:string):Promise<string>;
   updateCard(message:string,body:Record<string,unknown>):Promise<void>;
+  ensureDirectChat?(user:string,key:string):Promise<string>;
   health():unknown;
 }
 export type Thread = {id:string;cwd:string;name?:string;preview?:string;status?:{type:string};turns?:any[];updatedAt?:number};
 const help = `先选择目录和会话，再直接发送文字。\n\n/dirs — 目录\n/sessions [完整目录] — 会话\n/select <会话ID> — 载入已有会话\n/status — 最新进展与待处理请求\n/interrupt — 中断当前轮次\n/unbind — 取消本对话绑定\n/health — 服务状态\n/help — 菜单\n\n运行中发送的文字会尝试补充给当前轮次。模型设置和权限沿用 Codex 原会话；不会自动放宽权限。`;
-const menu:CardAction[] = [{label:'选择目录',command:'/dirs'},{label:'选择会话',command:'/sessions'},{label:'最新进展',command:'/status'}];
+const menu:CardAction[] = [{label:'选择目录',command:'/dirs'},{label:'选择会话',command:'/sessions'},{label:'最新进展',command:'/status'},{label:'更多操作',command:'/more'}];
+const menuCommands = new Set(['/dirs','/sessions','/status','/more']);
 const safeError = (e:unknown) => e instanceof Error ? e.message.slice(0,1000) : '操作失败';
 const textId = (s:string) => s.replace(/[\r\n`]/g,' ').slice(0,150);
 
@@ -56,9 +58,12 @@ export class Bridge {
     while((this.draining||this.polling||this.flushing)&&Date.now()<deadline)await new Promise(r=>setTimeout(r,20));
   }
   receive(e:{id:string;chatId:string;userId:string;text:string;kind:string;messageId?:string}) {
-    if (this.closing||!this.config.allowedUsers.includes(e.userId) || !e.chatId || e.text.length>50_000) return;
+    if (this.closing||!this.config.allowedUsers.includes(e.userId) || e.text.length>50_000) return;
+    if(e.kind==='menu'&&!menuCommands.has(e.text))return;
+    if(e.kind!=='menu'&&!e.chatId)return;
     if(e.kind==='action'&&(!e.messageId||!this.store.hasReceipt(e.messageId,e.chatId)))return;
-    if (this.store.ingest(e)) void this.drain();
+    if(['message','action'].includes(e.kind)&&/^oc_[A-Za-z0-9_-]+$/.test(e.chatId))this.store.rememberDirectChat(e.userId,e.chatId);
+    if (this.store.ingest(e.kind==='menu'?{...e,chatId:''}:e)) void this.drain();
   }
   async tick() { if(this.closing)return;await this.drain(); await this.poll(); await this.flush(); }
   private reply(e:Inbox,title:string,text:string,actions:CardAction[]=menu) {
@@ -70,14 +75,29 @@ export class Bridge {
     try {
       for (const e of this.store.queued()) {
         if(this.closing)break;
-        if (!this.config.allowedUsers.includes(e.user)) { this.store.mark(e.id,'rejected'); continue; }
+        if (!this.config.allowedUsers.includes(e.user)||(e.kind==='menu'&&!menuCommands.has(e.text))) { this.store.mark(e.id,'rejected'); continue; }
         this.store.mark(e.id,'processing');
-        try { await this.route(e); this.store.mark(e.id,'done'); }
+        // Ignore even a previously persisted menu destination until it has been
+        // resolved from trusted p2p ingress or an Open API message receipt.
+        if(e.kind==='menu')e.chat='';
+        try {
+          if(e.kind==='menu') {
+            let chat=this.store.directChat(e.user);
+            if(!chat) {
+              if(!Number.isFinite(e.created)||Date.now()-e.created>50*60_000)throw new Error('菜单请求已过期，请重新点击菜单');
+              if(!this.lark.ensureDirectChat)throw new Error('无法取得单聊会话，请先给机器人发送一条消息');
+              chat=await this.lark.ensureDirectChat(e.user,stableId('menu-p2p:'+e.id));
+              this.store.rememberDirectChat(e.user,chat);
+            }
+            this.store.routeMenu(e.id,chat);e.chat=chat;
+          }
+          await this.route(e); this.store.mark(e.id,'done');
+        }
         catch (err) {
           // A lost RPC response is not proof that the model did not receive input.
           const status = this.store.db.prepare('SELECT status FROM inbox WHERE id=?').get(e.id)?.status;
           this.store.mark(e.id,status==='dispatching'?'uncertain':'failed');
-          this.reply(e,status==='dispatching'?'请求结果需核对':'操作未完成',safeError(err)+(status==='dispatching'?'\n\n未自动重试。请先 /status 核对，避免重复执行。':''));
+          if(e.chat)this.reply(e,status==='dispatching'?'请求结果需核对':'操作未完成',safeError(err)+(status==='dispatching'?'\n\n未自动重试。请先 /status 核对，避免重复执行。':''));
         }
       }
     } finally { this.draining=false; }
@@ -88,6 +108,13 @@ export class Bridge {
     const at=text.indexOf(' ');
     const command=at<0?text:text.slice(0,at), arg=at<0?'':text.slice(at+1).trim();
     if (['/help','/start','/menu'].includes(command)) { this.reply(e,'菜单',help); return; }
+    if(command==='/more') {
+      const b=this.store.binding(e.chat,e.user);
+      const actions:CardAction[]=[{label:'服务状态',command:'/health'},{label:'使用帮助',command:'/help'}];
+      if(b)actions.push({label:'解除绑定',command:`/unbind ${b.thread}`},{label:'中断当前轮次',command:`/interrupt-confirm ${b.thread}`,type:'danger'});
+      this.reply(e,'更多操作',b?`当前会话：\`${b.thread}\`\n解除绑定后可选择其他会话；中断操作会先确认当前轮次。`:'选择一个会话后，可以在这里解除绑定或中断当前轮次。',actions);
+      return;
+    }
     if(command==='/health') { this.reply(e,'服务状态','```json\n'+JSON.stringify({host:this.config.host,codex:this.codex.health(),lark:this.lark.health(),state:this.store.health()},null,2)+'\n```'); return; }
     if(command==='/dirs') {
       const {threads,truncated}=await this.list();
@@ -125,6 +152,7 @@ export class Bridge {
       return;
     }
     if(command==='/unbind') {
+      if(arg&&arg!==this.store.binding(e.chat,e.user)?.thread)throw new Error('会话已切换，旧卡片不能解除当前会话的绑定');
       this.store.unbind(e.chat,e.user);
       this.reply(e,'已取消绑定','选择另一个会话即可继续。取消绑定不会中断 Codex 任务。'); return;
     }
@@ -132,14 +160,26 @@ export class Bridge {
     if(!b) { this.reply(e,'请先选择会话',help); return; }
     if(command==='/status') {
       if(arg&&arg!==b.thread)throw new Error('这张卡片属于之前的会话；请重新选择该会话或发送 /status 查看当前会话');
-      await this.refresh(b,true); return;
+      await this.refresh(b,true,e.id); return;
     }
     if(command==='/approve'||command==='/deny'||command==='/answer') { this.answer(e,b,command,arg); return; }
+    if(command==='/interrupt-confirm') {
+      if(arg!==b.thread)throw new Error('会话已切换，请从更多操作重新选择中断当前轮次');
+      const t=await this.read(b.thread),active=this.active(t);
+      if(!active) { this.reply(e,'当前没有运行中的轮次','可直接发送新的指令。'); return; }
+      this.reply(e,'确认中断当前轮次',`会话：**${textId(t.name||t.id)}**\n轮次：\`${active.id}\`\n确认后将请求停止这一轮正在进行的任务。`,[
+        {label:'确认中断',command:`/interrupt ${b.thread} ${active.id}`,type:'danger'},
+        {label:'取消',command:'/more'},
+      ]);return;
+    }
     if(command==='/interrupt') {
-      if(arg&&arg!==b.thread)throw new Error('会话已切换，旧卡片不能中断当前会话');
+      const [threadId,turnId,...extra]=arg?arg.split(/\s+/):[];
+      if(extra.length)throw new Error('中断请求格式无效，请从更多操作重新选择');
+      if(threadId&&threadId!==b.thread)throw new Error('会话已切换，旧卡片不能中断当前会话');
       await this.attach(b);
       const t=await this.read(b.thread), active=this.active(t);
       if(!active) { this.reply(e,'当前没有运行中的轮次','可直接发送新的指令。'); return; }
+      if(turnId&&turnId!==active.id)throw new Error('该轮次已经结束，旧确认卡片不能中断新轮次');
       this.store.mark(e.id,'dispatching',b.thread);
       await this.codex.request('turn/interrupt',{threadId:b.thread,turnId:active.id});
       this.reply(e,'已请求中断','等待 Codex 返回中断后的状态。'); this.dirty.add(b.thread); return;
@@ -198,7 +238,7 @@ export class Bridge {
     await this.codex.request('thread/resume',{threadId:b.thread,excludeTurns:true});
     this.attached.add(b.thread);
   }
-  async refresh(b:Binding,force=false) {
+  async refresh(b:Binding,force=false,requestId?:string) {
     const t=await this.read(b.thread); this.checkThread(t);
     const turns=t.turns??[], latest=turns.at(-1);
     const items=latest?.items??[];
@@ -219,8 +259,12 @@ export class Bridge {
     const fp=stableId(body);
     if(force||fp!==b.fingerprint) {
       const pending=this.store.pendingFor(b.thread);
-      this.store.putCard(`status:${b.thread}`,b.chat,card(`${this.config.host} · 最新进展`,body,[
-        {label:'刷新',command:`/status ${b.thread}`},{label:'中断当前轮次',command:`/interrupt ${b.thread}`,type:'danger'},{label:'切换会话',command:'/sessions'}]));
+      const progress=card(`${this.config.host} · 最新进展`,body,[
+        {label:'刷新',command:`/status ${b.thread}`},{label:'中断当前轮次',command:`/interrupt-confirm ${b.thread}`,type:'danger'},{label:'切换会话',command:'/sessions'}]);
+      this.store.putCard(`status:${b.thread}`,b.chat,progress);
+      // A manual request gets a new message at the bottom of the conversation.
+      // The event-derived key also makes a crash/retry reuse its original send.
+      if(requestId)this.store.putCard(`reply:${requestId}:0`,b.chat,progress);
       // Every complete answer part has a stable key and survives restarts.
       if(latest?.id&&latest.status!=='inProgress') {
         splitMarkdown(messages.join('\n\n')).filter(Boolean).forEach((part,i)=>this.store.putCard(`answer:${b.thread}:${latest.id}:${i}`,b.chat,card(`${this.config.host} · 回答 ${i+1}`,part)));

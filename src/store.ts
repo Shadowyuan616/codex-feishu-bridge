@@ -4,7 +4,7 @@ import { dirname } from 'node:path';
 import { createHash } from 'node:crypto';
 
 export interface Binding { chat: string; user: string; thread: string; cwd: string; fingerprint: string }
-export interface Inbox { id: string; chat: string; user: string; text: string; kind: string; status: string; thread: string | null }
+export interface Inbox { id: string; chat: string; user: string; text: string; kind: string; status: string; thread: string | null; created: number }
 export interface Outbox { key: string; chat: string; content: string; version: number; sent_version: number; message: string | null; attempts: number; created: number }
 export interface Pending { token: string; requestId: string; method: string; thread: string; chat: string; user: string; params: string; status: string }
 
@@ -21,6 +21,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS outbox(key TEXT PRIMARY KEY, chat TEXT, content TEXT, version INTEGER DEFAULT 1, sent_version INTEGER DEFAULT 0, message TEXT, attempts INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created INTEGER, error TEXT);
       CREATE TABLE IF NOT EXISTS pending(token TEXT PRIMARY KEY, requestId TEXT, method TEXT, thread TEXT, chat TEXT, user TEXT, params TEXT, status TEXT DEFAULT 'pending');
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+      CREATE TABLE IF NOT EXISTS direct_chats(user TEXT PRIMARY KEY, chat TEXT NOT NULL);
       CREATE UNIQUE INDEX IF NOT EXISTS pending_request ON pending(requestId);
     `);
   }
@@ -30,6 +31,24 @@ export class Store {
   }
   queued(): Inbox[] { return this.db.prepare("SELECT * FROM inbox WHERE status='received' ORDER BY created LIMIT 100").all() as unknown as Inbox[]; }
   mark(id: string, status: string, thread?: string) { this.db.prepare('UPDATE inbox SET status=?,thread=COALESCE(?,thread) WHERE id=?').run(status,thread ?? null,id); }
+  rememberDirectChat(user:string,chat:string) {
+    if(!/^ou_[A-Za-z0-9_-]+$/.test(user)||!/^oc_[A-Za-z0-9_-]+$/.test(chat))throw new Error('无效的单聊映射');
+    this.db.prepare('INSERT INTO direct_chats(user,chat) VALUES(?,?) ON CONFLICT(user) DO UPDATE SET chat=excluded.chat').run(user,chat);
+  }
+  directChat(user:string):string|undefined {
+    const saved=this.db.prepare('SELECT chat FROM direct_chats WHERE user=?').get(user)?.chat;
+    if(typeof saved==='string'&&/^oc_[A-Za-z0-9_-]+$/.test(saved))return saved;
+    // Only bindings and authenticated p2p/card ingress can seed old databases.
+    // Menu payloads have no chat_id and must never supply their own destination.
+    const previous=this.db.prepare("SELECT chat FROM bindings WHERE user=? UNION SELECT chat FROM inbox WHERE user=? AND kind IN ('message','action')").all(user,user);
+    const chats=[...new Set(previous.map(x=>x.chat).filter((chat):chat is string=>typeof chat==='string'&&/^oc_[A-Za-z0-9_-]+$/.test(chat)))];
+    if(chats.length!==1)return undefined;
+    this.rememberDirectChat(user,chats[0]!);return chats[0];
+  }
+  routeMenu(id:string,chat:string) {
+    if(!/^oc_[A-Za-z0-9_-]+$/.test(chat))throw new Error('无效的单聊会话');
+    this.db.prepare("UPDATE inbox SET chat=? WHERE id=? AND kind='menu'").run(chat,id);
+  }
   recover(): Inbox[] {
     const unknown = this.db.prepare("SELECT * FROM inbox WHERE status='dispatching'").all() as unknown as Inbox[];
     this.db.prepare("UPDATE inbox SET status='uncertain' WHERE status='dispatching'").run();

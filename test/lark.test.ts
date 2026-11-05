@@ -44,7 +44,7 @@ const waitFor = async (predicate: () => boolean, ms = 2_000): Promise<void> => {
   while (!predicate()) { if (Date.now() >= until) throw new Error('condition timed out'); await new Promise(resolve => setTimeout(resolve, 10)); }
 };
 
-test('waits for both consumers, keeps stdin open and stops only its children', async () => {
+test('waits for all three consumers, keeps stdin open and stops only its children', async () => {
   const f = await fixture(`
 const fs = require('node:fs');
 const args = process.argv.slice(2); fs.appendFileSync('calls.ndjson', JSON.stringify(args)+'\\n');
@@ -65,10 +65,75 @@ setTimeout(() => {
     assert.equal((cli.health() as { ready: boolean }).ready, true);
     await cli.stop();
     const calls = (await readFile(join(f.directory, 'calls.ndjson'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-    assert.equal(calls.length, 2);
+    assert.equal(calls.length, 3);
+    assert.ok(calls.some(args => args.includes('application.bot.menu_v6')));
     assert(calls.every(args => args.includes('consume') && !args.includes('stop')));
     assert(!JSON.stringify(logs).includes(message.content));
   } finally { await cli.stop(); await f.clean(); }
+});
+
+test('menu events use the operator identity and allowlisted commands without a card receipt', () => {
+  const menu = { type: 'application.bot.menu_v6', event_id: 'evt_menu', operator_open_id: 'ou_owner', event_key: 'codex_status' };
+  for (const [key, command] of [['codex_dirs','/dirs'],['codex_sessions','/sessions'],['codex_status','/status'],['codex_more','/more']]) {
+    assert.deepEqual(normalizeEvent({...menu,event_key:key,chat_id:'oc_spoof'}),
+      {id:'evt_menu',chatId:'',userId:'ou_owner',text:command,kind:'menu'});
+  }
+  assert.equal(normalizeEvent({...menu,operator_open_id:undefined,operator_id:'ou_owner'})?.userId,'ou_owner');
+  for (const invalid of [{...menu,event_id:undefined},{...menu,operator_open_id:undefined},
+    {...menu,event_key:'/interrupt'},{...menu,event_key:'__proto__'},{...menu,operator_id:'ou_someone_else'}]) {
+    assert.equal(normalizeEvent(invalid),null);
+  }
+});
+
+test('a pending menu subscription preserves message/card consumers and recovers after authorization', async () => {
+  const f=await fixture(`
+const fs=require('node:fs');const key=process.argv[process.argv.indexOf('consume')+1];
+if(key==='application.bot.menu_v6')fs.appendFileSync('menu-attempts','1');
+if(key==='application.bot.menu_v6'&&!fs.existsSync('subscribed')) {
+ process.stderr.write(JSON.stringify({ok:false,error:{type:'validation',subtype:'failed_precondition'}}));process.exit(2);
+}
+process.stdin.resume();process.stdin.on('end',()=>process.exit(0));
+process.stderr.write('[event] ready event_key='+key+'\\n');
+if(key==='application.bot.menu_v6'&&!fs.existsSync('dropped-once')) {
+ fs.writeFileSync('dropped-once','yes');setTimeout(()=>process.exit(4),40);
+}
+if(key==='im.message.receive_v1')setTimeout(()=>process.stdout.write(JSON.stringify(${JSON.stringify(message)})+'\\n'),10);
+`);
+  const cli=new LarkCli({binary:f.binary,cwd:f.directory,configurationRetryMs:40,restartBaseMs:10,maxRestarts:1,startupTimeoutMs:2000});
+  const events:string[]=[];
+  try {
+    await cli.start(e=>events.push(e.id));
+    await waitFor(()=>events.includes('evt_1'));
+    const before=cli.health() as {running:boolean;ready:boolean;consumers:{key:string;ready:boolean;permanent:boolean}[]};
+    assert.ok(before.running&&!before.ready);
+    assert.ok(before.consumers.filter(c=>c.key!=='application.bot.menu_v6').every(c=>c.ready));
+    assert.ok(before.consumers.every(c=>!c.permanent));
+    // Configuration waits must not exhaust the budget for later network retries.
+    while((await readFile(join(f.directory,'menu-attempts'),'utf8')).length<3)await new Promise(r=>setTimeout(r,20));
+    await writeFile(join(f.directory,'subscribed'),'yes');
+    await waitFor(()=>(cli.health() as {ready:boolean}).ready);
+    await new Promise(r=>setTimeout(r,150));
+    await waitFor(()=>(cli.health() as {ready:boolean}).ready);
+    assert.ok((cli.health() as {consumers:{permanent:boolean}[]}).consumers.every(c=>!c.permanent));
+    assert.equal(events.filter(id=>id==='evt_1').length,1);
+  } finally {await cli.stop();await f.clean();}
+});
+
+test('first-menu P2P bootstrap targets only the operator with a stable idempotency key', async () => {
+  const f = await fixture(`
+const fs=require('node:fs'); const args=process.argv.slice(2);
+fs.appendFileSync('calls.ndjson',JSON.stringify(args)+'\\n');
+process.stdout.write(JSON.stringify({ok:true,data:{message_id:'om_welcome',chat_id:'oc_direct'}}));
+`);
+  const cli=new LarkCli({binary:f.binary,cwd:f.directory});
+  try {
+    assert.equal(await cli.ensureDirectChat('ou_owner','stable-menu-event'),'oc_direct');
+    const args=JSON.parse((await readFile(join(f.directory,'calls.ndjson'),'utf8')).trim());
+    assert.equal(args[args.indexOf('--user-id')+1],'ou_owner');
+    assert.equal(args[args.indexOf('--idempotency-key')+1],'stable-menu-event');
+    assert.ok(!args.includes('--chat-id'));
+    await assert.rejects(cli.ensureDirectChat('oc_wrong','key'),/user ID/);
+  } finally {await f.clean();}
 });
 
 test('card sends preserve argv and idempotency; patches use stdin', async () => {
