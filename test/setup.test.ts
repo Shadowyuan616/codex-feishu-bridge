@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createServer } from 'node:net';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -43,6 +43,8 @@ test('rerunning setup cannot overwrite configuration or follow an output symlink
 
 test('setup rejects public output, missing socket, placeholders, and unknown flags without writing files',async t=>{
   const f=await fixture(t),publicDir=join(f.base,'public');mkdirSync(publicDir,{mode:0o755});
+  // Service environments use umask 0077; make the unsafe fixture explicit.
+  chmodSync(publicDir,0o755);
   assert.throws(()=>configure(f.args.map(x=>x===f.output?publicDir:x),f.repo),/700/);
   const file=join(f.base,'regular-file');writeFileSync(file,'not a socket');
   assert.throws(()=>configure(f.args.map(x=>x===f.socket?file:x),f.repo),/socket/);
