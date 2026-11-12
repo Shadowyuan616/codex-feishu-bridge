@@ -1,0 +1,4 @@
+interface:
+  display_name: "安装 Codex 飞书桥接"
+  short_description: "在开发机安装并配置 Codex 飞书桥接，验证消息、固定菜单和持久运行"
+  default_prompt: "请用 $install-codex-feishu-bridge 在我的开发机安装和配置桥接，保留现有 Codex 会话。"

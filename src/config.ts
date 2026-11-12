@@ -12,7 +12,16 @@ export interface Config {
 }
 
 export function loadConfig(path: string): Config {
-  const c = JSON.parse(readFileSync(path, 'utf8')) as Config;
+  const source=readFileSync(path, 'utf8');
+  let value:unknown;
+  try { value=JSON.parse(source); }
+  catch { throw new Error('配置文件不是有效 JSON（内容已隐藏）'); }
+  return validateConfig(value);
+}
+
+export function validateConfig(value: unknown): Config {
+  if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('配置必须是 JSON 对象');
+  const c = structuredClone(value) as Config;
   if (!c.host || !/^[a-zA-Z0-9_-]+$/.test(c.host)) throw new Error('host 必须是机器标识');
   if (!isAbsolute(c.stateDir ?? '')) throw new Error('stateDir 必须是绝对路径');
   if (!Array.isArray(c.allowedUsers) || !c.allowedUsers.length || c.allowedUsers.some(x => !/^ou_[A-Za-z0-9]+$/.test(x))) {
@@ -26,6 +35,7 @@ export function loadConfig(path: string): Config {
     return actual;
   });
   if (!c.lark?.binary || !c.codex?.binary || !Array.isArray(c.codex.args)) throw new Error('缺少 CLI 配置');
+  for(const binary of [c.lark.binary,c.codex.binary])if(typeof binary!=='string'||!isAbsolute(binary))throw new Error('CLI binary 必须使用绝对路径');
   if(c.codex.args.includes('proxy'))throw new Error('proxy 透传 WebSocket，不能使用 JSONL 客户端；请配置 socketPath');
   if(c.codex.socketPath&&!isAbsolute(c.codex.socketPath))throw new Error('codex.socketPath 必须是共享 daemon socket 的绝对路径');
   if (!c.codex.socketPath&&!c.codex.args.includes('--stdio')) {

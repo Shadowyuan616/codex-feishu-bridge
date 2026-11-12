@@ -2,7 +2,7 @@
 
 以下是两种可选启动方式。仓库不会自动安装服务、启动 daemon 或修改开发机。每台机器的 worker 使用自己的飞书应用和配置，并连接该机器已有 Codex daemon；Mac 不参与持续运行。
 
-先在开发机安装 Node.js 22.13+、Python 3.9+，构建本项目并完成 `config.local.json`。代码和配置可以放在集群的持久卷；**SQLite WAL 的 `stateDir` 必须放在开发机本地 XFS/ext4 等可靠本地文件系统上，不放在 GPFS/NFS 共享盘**。dev-a 可使用 `/root/.local/state/codex-feishu-bridge`。supervisor 锁和日志也优先使用该本地目录。配置文件权限应为 `600`，目录仅该用户可访问。`lark.binary`、Node 和 Python 建议用绝对路径，避免非交互 shell 的 PATH 差异。
+先在开发机安装 Node.js 22.13+、Python 3.9+，构建本项目并完成 `config.local.json`。代码和配置可以放在集群的持久卷；**SQLite WAL 的 `stateDir` 必须放在开发机本地 XFS/ext4 等可靠本地文件系统上，不放在 GPFS/NFS 共享盘**。状态路径需按当前机器的实际存储选择。supervisor 锁和日志也优先使用该本地目录。配置文件权限应为 `600`，目录仅该用户可访问。`lark.binary`、Node 和 Python 建议用绝对路径，避免非交互 shell 的 PATH 差异。
 
 共享 daemon 的设置见 [Codex 协议说明](../docs/codex-protocol.md)。配置 `codex.socketPath` 为现有 control socket 的绝对路径，worker 用 Unix WebSocket 连接。`app-server proxy` 是原始 WebSocket 字节隧道，不能作为逐行 JSON 子进程使用；只有显式独立 stdio 模式才使用 `codex.binary`/`codex.args`。worker 重启不会执行 daemon start/stop/restart，也不会终止已有模型任务。
 
@@ -16,7 +16,7 @@ systemctl --user enable --now codex-feishu-bridge.service
 systemctl --user status codex-feishu-bridge.service
 ```
 
-这是安装示例，当前开发任务不会执行这些命令。用户 systemd 是否在登出后继续运行取决于该环境的 user manager/linger 配置。需要 linger 时先确认集群允许该配置；不需要 root 的前提是用户服务管理本身已可用。dev-a 当前检查为 `Linger=no`，应使用独立 system service 模板 `codex-feishu-bridge-system.service`，由有权限的操作者填写实际用户与 env 路径后安装；不修改现有 Codex daemon unit。很多开发容器没有 systemd，此时选方式二。
+用户 systemd 是否在登出后继续运行取决于该环境的 user manager/linger 配置。需要 linger 时先确认集群允许该配置；不需要 root 的前提是用户服务管理本身已可用。若用户服务不能在登出后持续运行，可使用独立 system service 模板 `codex-feishu-bridge-system.service`，由有权限的操作者填写实际用户与 env 路径后安装；不修改现有 Codex daemon unit。很多开发容器没有 systemd，此时选方式二。
 
 unit 也调用本项目 supervisor，从而与方式二共用同一个 `supervisor.lock`，避免两种启动器同时运行。不要给同一配置使用两个不同的 supervisor state 目录。
 

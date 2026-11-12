@@ -1,144 +1,299 @@
 # Codex Feishu Bridge
 
-通过飞书私聊选择开发机上的**已有 Codex 会话**、查看最新进展、发送指令、补充运行中
-任务并处理支持的审批。每台开发机独立运行一个 worker，复用该机的飞书 CLI profile
-和 Codex 登录；运行期间无需 Mac、SSH 隧道或公网入站端口。
+在手机飞书里选择开发机上的**已有 Codex session**、查看最新进展、发送任务或补充
+运行中的指令。开发机持续运行桥接服务，Mac 和 SSH 断开后仍可使用。
 
-当前是可构建、可测试的初版。真实开发机部署、飞书权限和端到端收发需要按机器分别
-验收；仓库中的测试通过不代表三台集群都已部署完成。
+每台机器使用自己的飞书机器人/profile，连接该机已有的 Codex daemon；切换机器人
+就是切换机器。只需要出站网络，不需要开放公网入站端口。
 
-## 已实现的交互
+## 让智能体安装
 
-| 在飞书里做什么 | 行为 |
+复制这段提示词给能连接目标开发机的 Codex 或其他支持 `SKILL.md` 的智能体：
+
+```text
+请安装 https://github.com/Shadowyuan616/codex-feishu-bridge/tree/main/skills/install-codex-feishu-bridge 中的 Skill，并用它在我的开发机配置本项目；复用已有登录，不中断运行中的 session。
+```
+
+Skill 会先确认目标机器、允许控制的用户和项目目录，再安装、配置和验证。
+浏览器登录、应用发布或管理员授权需要你本人完成时，它会给出具体入口。
+
+也可以克隆仓库后，将 `skills/install-codex-feishu-bridge` 整个目录复制到智能体
+支持的 Skill 目录，再在新对话中调用 `$install-codex-feishu-bridge`。
+例如 Codex 当前支持 `~/.agents/skills/`；已有版本也可能使用
+`${CODEX_HOME:-$HOME/.codex}/skills/`，以当前客户端发现到的 Skill 目录为准。
+安装已有同名 Skill 前先比较，避免覆盖你的定制版本。
+[Skill 原文](skills/install-codex-feishu-bridge/SKILL.md) · [Codex Skill 文档](https://developers.openai.com/codex/skills)
+
+## 你能在飞书里做什么
+
+| 入口 | 行为 |
 | --- | --- |
-| `/dirs` | 列出授权目录内已有会话涉及的目录，提供选择按钮。 |
-| `/sessions [完整目录]` | 按目录查看会话，显示名称、工作目录、ID 和状态；支持翻页。 |
-| `/select <完整会话ID>` | 载入既有会话，沿用其工作目录、模型和权限。 |
-| 直接发送文字 | 空闲时开始下一轮；运行中使用当前 turn ID 补充指令。 |
-| `/status` | 查看最新两轮历史中最近一轮的可见回复和工具状态；状态卡默认每 10 秒刷新。 |
-| `/interrupt` | 请求中断当前轮次；旧会话的状态卡不能中断新选中的会话。 |
-| 审批按钮、问答按钮 | 处理命令执行、文件变更的单次批准/拒绝，以及结构化用户问答。 |
-| `/unbind`、`/health`、`/help` | 取消绑定、查看健康状态、打开菜单。 |
+| 选择目录 | 编号＋末级目录名，下方展示完整路径；每页 8 项。 |
+| 选择会话 | 按 active → idle → notLoaded 排序；显示最近提示词摘要，编号与选择按钮对应。 |
+| 最新进展 | 在对话底部新发进展卡片，展示范围以最新模型回复为终点。 |
+| 更多操作 | 服务状态、帮助、解除绑定、中断当前轮次；菜单中断需要再次确认。 |
+| 直接发送文字 | 空闲时开始新一轮；运行中补充给当前轮次。 |
+| 审批或问答卡片 | 处理支持的命令/文件单次审批与结构化用户问答。 |
 
-长回复按 UTF-8 字节拆成多张卡片，代码块跨卡片时补齐围栏。SQLite 保存会话绑定、
-消息去重、审批状态及待发送卡片；发送失败会退避重试。模型指令提交后失去回执时会
-标记“结果需核对”，不会在重启后自动重新执行。
+没有固定菜单时，也可以发送 `/dirs`、`/sessions`、`/status`、`/more`。
+`/sessions /完整目录` 按目录筛选；`/select 会话ID` 载入指定会话。
+`/unbind` 解除绑定，`/health` 查看服务状态。后台自动更新原状态卡片，最终回复按需
+分卡发送；主动点击“最新进展”才新发快照，避免轮询刷屏。
 
-## 架构
+## 手动安装
 
-```mermaid
-flowchart LR
-  Phone[飞书 App 私聊] <-->|消息与卡片| Feishu[飞书开放平台]
-  subgraph Host[一台开发机；每个集群独立部署]
-    CLI[该机飞书 CLI profile]
-    Bridge[Bridge worker]
-    DB[(本机 SQLite 状态)]
-    Daemon[已有 Codex daemon]
-    Terminal[连接同一 daemon 的终端]
-    Supervisor[systemd 或进程监督器]
-    CLI <--> Bridge
-    Bridge <--> DB
-    Bridge <-->|Unix socket 上的 WebSocket| Daemon
-    Terminal <--> Daemon
-    Supervisor --> Bridge
-  end
-  Feishu <-->|出站长连接| CLI
-```
+以下步骤都在**运行 Codex 的目标开发机**上完成，并使用拥有既有 Codex 和飞书配置
+的同一操作系统用户。多台机器分别执行，不共享 SQLite 状态目录。
 
-`dev-a`、`dev-c`、`dev-b` 各自使用独立配置、状态目录和飞书应用/profile。
-切换飞书应用就是切换机器，再从该应用内选择目录和会话。初版没有一个机器人统一
-跨集群调度的中央服务。
+### 阶段 1：准备环境和代码
 
-## 快速开始
-
-在目标开发机准备 Node.js **22.13+**、已登录且支持 `event consume` 的飞书 CLI，
-以及运行中的 Codex daemon。共享会话必须使用该 daemon 的真实 Unix socket。
-开发机上的全局 Node 可能过旧，服务配置应使用已核验的 Node 绝对路径。
+需要 Git、Node.js **22.13+**（推荐已安装的 Node 24）、Python **3.9+**，以及支持
+daemon/Unix socket 的 Codex CLI 和支持 `event consume` 的飞书 CLI。
 
 ```sh
-npm ci
+node --version
+python3 --version
+codex --version
+lark-cli --version
+
+git clone https://github.com/Shadowyuan616/codex-feishu-bridge.git
+cd codex-feishu-bridge
+npm ci --ignore-scripts
 npm run build
-npm test
-python3 -m unittest discover -s deploy -p 'test_*.py'
-cp config.example.json config.local.json
-chmod 600 config.local.json
 ```
 
-编辑 `config.local.json` 后运行：
+缺少 CLI 时，按官方方式安装；已经安装并在运行任务的环境直接复用，不自动升级：
 
 ```sh
-npm start -- --config /absolute/path/config.local.json --check-config
-npm start -- --config /absolute/path/config.local.json --doctor
-npm start -- --config /absolute/path/config.local.json
+npm install -g @openai/codex
+npx @larksuite/cli@latest install
 ```
 
-`--check-config` 只检查配置；`--doctor` 检查飞书 CLI 版本与 Codex 只读协议连接，
-**不验证飞书消息权限、按钮回调或真实投递**。持续运行请选择
-[运维说明](docs/operations.md)中的监督方式，不依赖一个开着的 SSH 终端。
+来源：[Codex CLI](https://developers.openai.com/codex/cli)、[飞书官方 CLI](https://github.com/larksuite/cli)。
+本项目曾在 Codex daemon 0.162–0.165、飞书 CLI 1.0.97–1.0.98 上验证；这些是已测版本，
+不代表对其他版本的完整兼容承诺。当前安装以命令能力和后续自检为准。
 
-关键配置：
+### 阶段 2：确认共享 Codex daemon
 
-- `host`：例如 `dev-a`，用于卡片标识。
-- `allowedUsers`：只填允许操作者的真实飞书 `open_id`。样例中的
-  `ou_REPLACE_WITH_YOUR_OPEN_ID` 是有意不能通过校验的占位符，必须替换。
-- `allowedRoots`：现存的绝对目录。会话工作目录必须位于这些真实路径内，符号链接
-  和 `../` 不会绕过范围检查。
-- `stateDir`：该机独占、用户私有的**本地持久文件系统**目录；优先已核验的本地
-  XFS/ext4。SQLite WAL 状态库不要放在 GPFS/NFS 或未经验证的跨主机共享挂载上。
-  代码和配置可以保存在集群持久卷，但这不代表该卷适合运行 SQLite WAL。
-- `lark.binary/profile/cwd`：已有飞书 CLI 的路径、已配置 profile，以及必要时用于
-  查找已有工作区配置的目录；不把应用密钥写入仓库。
-- `codex.socketPath`：已有 daemon 的绝对 Unix socket 路径，使用直接 WebSocket
-  传输；共享模式的 `codex.args` 设为空数组。`codex.binary` 保留为配置中的明确
-  Codex 路径，不借此启动或重启共享 daemon。
-- `pollIntervalMs`：默认 `10000`，不得小于 `1000`。
+```sh
+codex app-server daemon version
+```
 
-**不要把 `codex app-server proxy` 的原始字节当作 JSONL。** dev-a 的 daemon
-0.165.0 已只读核验使用 HTTP WebSocket Upgrade 和 WebSocket 帧。
-`codex app-server --stdio` 的逐行 JSON 仅适用于明确选择的独立进程模式；它不能
-替代共享 daemon 来接管另一终端正在持有写锁的会话。
+使用输出中已有 daemon 的真实 control socket，记为 `BRIDGE_SOCKET`。它通常位于
+Codex 主目录的 `app-server-control/app-server-control.sock`，不要仅凭默认路径猜测。
+`CODEX_HOME`、操作系统用户与已有会话必须一致。
 
-## 飞书应用配置
+仅在**尚无 daemon、也没有需要保持的独立运行会话**的新环境中，先按提示登录，再启动：
 
-复用每台机器的现有自建应用与 bot 身份，限制到指定操作者和所需项目目录。
-当前文本私聊链路需要：
+```sh
+codex login
+codex app-server daemon start
+codex app-server daemon version
+```
 
-1. 开启机器人能力，操作者在应用可用范围内。
-2. 核对私聊消息接收 `im:message.p2p_msg:readonly`、机器人发消息
-   `im:message:send_as_bot`，以及当前 CLI 卡片回调消费者要求的
-   `im:message:readonly`。以实际 CLI 的 `missing_scopes` 和开放平台权限要求为准。
-3. 在事件配置中订阅 `im.message.receive_v1`，在回调配置中订阅
-   `card.action.trigger`，使用长连接模式。
-4. **发布包含权限与订阅变更的应用版本**，并完成所在组织要求的审核。
+以后在终端与飞书共享会话时，终端也连接同一个 daemon：
 
-成功发送一张卡片不代表按钮回调已生效。该桥接不自动扩大权限、不自动登录用户
-OAuth，也不需要为尚未实现的群聊、通讯录或附件功能申请额外权限。
-参考：[飞书机器人权限说明](https://open.feishu.cn/document/develop-robots/add-bot-to-external-group)、
-[官方回调概述](https://open.feishu.cn/document/event-subscription-guide/callback-subscription/callback-overview)。
+```sh
+# 把路径替换为上一步核对的真实 socket
+BRIDGE_SOCKET="/absolute/existing-codex-home/app-server-control/app-server-control.sock"
+codex --remote "unix://$BRIDGE_SOCKET" resume
+```
 
-## 当前边界
+如果没有已有 session，可用 `codex --remote "unix://$BRIDGE_SOCKET" -C /absolute/project`
+先建立一个测试会话。本项目只选择已有会话。
+正在独立终端/其他 app-server 中运行的会话不能被强行接管；不要杀进程或重启 daemon
+来解决写锁问题。更多说明见 [协议与连接边界](docs/codex-protocol.md)。
 
-- 支持**私聊文本和本服务发出的按钮**；群聊、图片/文件/语音附件尚不支持。
-- 只选择已有 session，尚未实现从飞书创建新 session、任意修改模型或配置。
-- 一个会话只绑定一个控制对话与操作者；不能让不同聊天同时争用同一会话的审批。
-- 同一个正在运行的会话要求客户端连接同一 daemon。被独立终端或另一 app-server
-  持有的会话不能强行接管；不会终止现有进程来绕过写锁。
-- 命令/文件审批和用户问答已实现。其他 MCP、动态工具或权限请求会明确提示未支持，
-  必须在连接同一 daemon 的终端处理；不会自动批准或伪造回答。
-- 提供会话操作的语义交互，不复制终端像素 UI，也不提供任意交互式 shell/TUI。
-- 状态卡按事件与轮询更新，最终回复完整分卡片展示；不是完整的逐字 CardKit 流式
-  渲染，也不是整段历史自动同步。
-- 监督器能恢复 worker 进程故障；机器/容器重建后恢复还需要平台启动 hook、可用的
-  持久数据以及 Codex daemon 恢复。尚未配置并验证这些条件时，不承诺重建自动恢复。
+### 阶段 3：配置飞书机器人和事件
 
-## 开源复用与验证
+**已有应用**：使用已有 profile；不重新创建应用、不覆盖凭据。
+**新应用**：可以通过 CLI 创建一个命名 profile，按输出链接在浏览器完成：
 
-交互功能参考直接桥接类热门项目 [cc-connect](https://github.com/chenhg5/cc-connect)。
-实际卡片构建复用[飞书官方 OpenClaw 插件](https://github.com/larksuite/openclaw-lark)
-固定版本的 MIT 纯函数子集，未引入整个 OpenClaw 运行时。
-热度、许可核验和取舍见[选型记录](docs/open-source-selection.md)；代码改编和版权见
-[第三方声明](THIRD_PARTY_NOTICES.md)及[随附 MIT 许可证](vendor/openclaw-lark/LICENSE)。
+```sh
+lark-cli config init --new --name dev-a
+```
 
-自动测试覆盖传输握手、事件解析、命令去重、审批绑定、重启恢复、并发卡片更新和
-故障退避。真实运行的验收方法、存储要求和故障处置见
-[运维说明](docs/operations.md)，协议差异见[Codex 协议说明](docs/codex-protocol.md)。
+已有手工创建的应用也可用 `lark-cli config init --name dev-a` 交互配置。
+App Secret 只交给飞书 CLI 的本地凭据管理；非交互配置使用其 `--app-secret-stdin`，
+不把密钥粘贴到聊天、命令参数、README 或 Git。桥接使用 **bot 身份**，不需要为了
+此功能额外执行面向日历/文档等功能的用户 OAuth 授权。
+
+在应用后台开启机器人能力，确认你在应用可用范围内。按功能添加以下权限：
+
+| 权限 | 用途 |
+| --- | --- |
+| `im:message.p2p_msg:readonly` | 接收私聊消息 |
+| `im:message:send_as_bot` | 机器人发送消息 |
+| `im:message:readonly` | 当前 CLI 卡片回调及消息回读 |
+| `application:bot.menu:write` | 配置四项个性化固定菜单 |
+
+在“事件与回调”中配置**长连接**：
+
+- 事件订阅：`im.message.receive_v1`、`application.bot.menu_v6`。
+- 回调订阅：`card.action.trigger`，它在回调配置中单独添加。
+- 保存，并按后台提示发布版本、完成审核。缺少权限以当前 CLI 和后台提示为准。
+
+只发送成功不代表按钮能点击。可以用短时消费者检查订阅；缺项时 CLI 会给出授权或
+配置指引，按它补齐对应项目：
+
+```sh
+BRIDGE_PROFILE="dev-a"
+lark-cli --profile "$BRIDGE_PROFILE" event consume application.bot.menu_v6 --as bot --timeout 3s
+lark-cli --profile "$BRIDGE_PROFILE" event consume card.action.trigger --as bot --timeout 3s
+```
+
+取得**该应用下你自己的 open_id**：在开发机执行下面的只读监听，然后由你在飞书私聊
+该机器人发送“绑定”。核对发送者是你本人，把返回的 `sender_id` 私下填入下一步。
+不同应用下的 open_id 可能不同，不要从别人的配置复制。
+
+```sh
+lark-cli --profile "$BRIDGE_PROFILE" event consume im.message.receive_v1 \
+  --as bot --max-events 1 --timeout 90s --jq '{sender_id,chat_type}'
+```
+
+### 阶段 4：生成私有配置
+
+先选好允许操作的项目根目录，以及可靠的**本地持久状态目录**。
+Linux 可用 `findmnt -T /chosen/state/parent` 检查存储；SQLite WAL 状态库不要放到
+NFS/GPFS 等共享文件系统。配置可放持久卷，状态数据库的存储条件需独立核实。
+
+将示例中的路径和用户 ID 换成真实值：
+
+```sh
+BRIDGE_CONFIG_DIR="$HOME/.config/codex-feishu-bridge"
+BRIDGE_PROJECT="/absolute/project-root"
+BRIDGE_STATE="/absolute/local-persistent/bridge-state"
+BRIDGE_USER="ou_REPLACE_WITH_YOUR_OPEN_ID"
+
+npm run configure -- \
+  --host dev-a \
+  --root "$BRIDGE_PROJECT" \
+  --user "$BRIDGE_USER" \
+  --socket "$BRIDGE_SOCKET" \
+  --state-dir "$BRIDGE_STATE" \
+  --profile "$BRIDGE_PROFILE" \
+  --output "$BRIDGE_CONFIG_DIR"
+```
+
+此命令只生成文件，**不登录、不启动服务、不修改正在运行的 session**：
+
+- `config.local.json`：用户白名单、项目范围、CLI 路径和共享 socket。
+- `bridge.env`：供 systemd 使用的运行路径。
+- `bot-menu.local.json`：该用户的四项菜单配置。
+
+输出目录权限为 `700`，文件为 `600`；已有文件会拒绝覆盖。
+支持重复 `--root`、`--user`；多用户会额外生成 `bot-menu-2.local.json` 等文件。
+CLI 不在 PATH 时可用 `--lark-bin`、`--codex-bin`、`--python-bin` 指定绝对路径；
+工作区绑定的飞书配置可补 `--lark-cwd`。完整选项：`npm run configure -- --help`。
+手工配置可参考 [config.example.json](config.example.json)，占位符不能通过校验。
+
+### 阶段 5：设置四个固定菜单
+
+```sh
+lark-cli --profile "$BRIDGE_PROFILE" api POST /open-apis/bot/v3/bot_menu \
+  --as bot --params '{"user_id_type":"open_id"}' \
+  --data "@$BRIDGE_CONFIG_DIR/bot-menu.local.json"
+```
+
+多用户时对各自的菜单文件分别执行。四项名称为“选择目录、选择会话、最新进展、
+更多操作”，使用推送事件 `codex_dirs`、`codex_sessions`、`codex_status`、`codex_more`。
+应用已有自定义菜单时，先保留现有配置，确认本次是要替换该用户菜单。
+
+在手机上确认菜单常驻输入框上方。此个性化接口没有展示策略参数；若客户端显示为
+切换式菜单，在开发者后台将机器人自定义菜单设为**悬浮菜单**并发布，要求飞书 7.22+。
+[官方菜单指南](https://open.feishu.cn/document/client-docs/bot-v3/bot-customized-menu) ·
+[个性化菜单 API](https://open.feishu.cn/document/uAjLw4CM/ukTMukTMukTM/bot-v3/bot_menu/set_bot_menu)
+
+### 阶段 6：前台自检和真实收发
+
+```sh
+npm start -- --config "$BRIDGE_CONFIG_DIR/config.local.json" --check-config
+npm start -- --config "$BRIDGE_CONFIG_DIR/config.local.json" --doctor
+npm start -- --config "$BRIDGE_CONFIG_DIR/config.local.json"
+```
+
+`--check-config` 验证格式和目录；`--doctor` 检查 CLI 版本和 Codex 只读连接。
+它们都不能替代飞书收发验收。前台服务就绪后，在飞书选择目录与**独立测试 session**，
+发送 `只回复 BRIDGE_OK，不要调用工具。`，确认回答卡片到达，再点击“最新进展”。
+
+菜单订阅未完成时，现有消息/卡片功能继续运行，菜单消费者每 60 秒重试；完成授权后
+自动接通。完整模板见 [验收清单](docs/acceptance.md)。
+
+### 阶段 7：持久运行
+
+前台验收通过后，用 Ctrl+C 停止**桥接前台进程**，再选择一种监督方式。
+
+**有用户 systemd：** 默认配置生成目录可直接配合仓库模板。
+
+```sh
+mkdir -p "$HOME/.config/systemd/user"
+# 若已有同名服务，先比较和备份，不覆盖正在管理的实例。
+cp -n deploy/codex-feishu-bridge.service "$HOME/.config/systemd/user/"
+systemctl --user daemon-reload
+systemctl --user enable --now codex-feishu-bridge.service
+systemctl --user status codex-feishu-bridge.service
+```
+
+自定义了配置输出目录时，先修改 unit 中的 `EnvironmentFile` 为真实 `bridge.env`。
+用户服务能否登出后存活取决于 user manager/linger；需要管理员协助时只处理该服务。
+不能使用用户 systemd 时，可由管理员采用 [system service 模板](deploy/codex-feishu-bridge-system.service)。
+代理或其他必要环境只写到私有 `bridge.env`，不要提交、打印或覆盖系统全局配置。
+
+**无 systemd 的容器：** 将下列命令交给平台 startup hook 或已有进程管理器：
+
+```sh
+python3 deploy/supervise.py \
+  --state-dir "$BRIDGE_STATE/supervisor" \
+  --log-dir "$BRIDGE_STATE/logs" \
+  -- "$(command -v node)" "$PWD/dist/src/main.js" \
+  --config "$BRIDGE_CONFIG_DIR/config.local.json"
+```
+
+在 startup hook 中使用核对后的绝对路径，不依赖交互 shell 的变量。
+`nohup` 仅能防 SSH 断开，不能保证容器重建后自动启动；重建恢复还需要代码/配置、
+本地状态和 Codex daemon 的恢复方案。不要同时启动两个监督器管理同一实例。
+详见 [部署说明](deploy/README.md)与[运维说明](docs/operations.md)。
+
+安装后在另一终端检查：
+
+```sh
+npm start -- --config "$BRIDGE_CONFIG_DIR/config.local.json" --health
+```
+
+确认三种消费者 ready、消息队列正常，再断开 SSH 用手机操作。
+
+## 数据与权限边界
+
+桥接会把所选 session 的提示词、模型输出和审批内容发送到你配置的飞书应用。
+`allowedUsers` 限制操作者，`allowedRoots` 限制可见项目目录；它们不替代 Codex
+原有的工具权限和审批设置。只给需要的人和目录授权。
+
+- 凭据由 Codex/飞书 CLI 管理，本项目不需要保存 App Secret 或 OpenAI API Key。
+- 本地 SQLite 含会话内容、用户标识和审批数据；配置、数据库、日志、备份和真实验收
+  记录都不能公开。仓库附带忽略规则和隐私扫描，但它们不能代替发布前人工检查。
+- 支持私聊文本及服务发出的卡片按钮；群聊和输入图片/文件/语音尚不支持。
+- 只载入已有 session，不提供任意 shell/TUI、创建 session 或修改模型设置的完整界面。
+- 一个 session 绑定一个控制对话和操作者；未知审批类型不会被自动批准。
+- 指令提交后回执丢失会标记结果待核对，不在恢复时盲目重放。
+
+## 开发、隐私检查与复用
+
+```sh
+npm run check
+npm test
+npm run build
+python3 -m unittest discover -s deploy -p 'test_*.py'
+npm run privacy:check
+# 发布前：完整克隆中检查全部可达历史与提交邮箱
+npm run privacy:check -- --history
+# 提交前只检查暂存文件
+npm run privacy:check -- --staged
+```
+
+CI 自动扫描工作树中的真实身份标识、秘密模式和运行文件。独立审计与历史清理方法见
+[SECURITY.md](SECURITY.md)。提交作者建议使用 GitHub 提供的 noreply 邮箱。
+
+卡片构建复用[飞书官方 OpenClaw 插件](https://github.com/larksuite/openclaw-lark)固定版本
+的 MIT 纯函数子集，不依赖整个 OpenClaw。保留[第三方声明](THIRD_PARTY_NOTICES.md)
+及[原始许可证](vendor/openclaw-lark/LICENSE)。
+交互方案与其他开源实现的取舍见[选型记录](docs/open-source-selection.md)。
