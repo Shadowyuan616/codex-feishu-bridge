@@ -1,5 +1,6 @@
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
+import type { MediaOptions } from './media.js';
 
 export interface Config {
   host: string;
@@ -9,7 +10,10 @@ export interface Config {
   lark: { binary: string; profile?: string; cwd?: string };
   codex: { binary: string; args: string[]; socketPath?:string; cwd?: string; env?: Record<string, string> };
   pollIntervalMs: number;
+  /** Images/files referenced by final answers. Optional; defaults to DEFAULT_MEDIA. */
+  media?: Partial<Pick<MediaOptions,'enabled'|'fileExtensions'>>;
 }
+
 
 export function loadConfig(path: string): Config {
   const source=readFileSync(path, 'utf8');
@@ -43,6 +47,14 @@ export function validateConfig(value: unknown): Config {
   }
   c.pollIntervalMs ??= 10_000;
   if (!Number.isFinite(c.pollIntervalMs) || c.pollIntervalMs < 1000) throw new Error('pollIntervalMs 至少 1000');
+  if (c.media !== undefined) {
+    if (!c.media || typeof c.media !== 'object' || Array.isArray(c.media)) throw new Error('media 必须是对象');
+    if (c.media.enabled !== undefined && typeof c.media.enabled !== 'boolean') throw new Error('media.enabled 必须是布尔值');
+    if (c.media.fileExtensions !== undefined && (!Array.isArray(c.media.fileExtensions)
+      || c.media.fileExtensions.some(x => typeof x !== 'string' || !/^[A-Za-z0-9]{1,10}$/.test(x)))) {
+      throw new Error('media.fileExtensions 必须是不带点的扩展名数组，如 ["xlsx","pdf"]');
+    }
+  }
   return c;
 }
 

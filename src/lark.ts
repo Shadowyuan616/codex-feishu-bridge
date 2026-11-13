@@ -64,6 +64,7 @@ export type LarkCliOptions = {
   cwd?: string;
   startupTimeoutMs?: number;
   commandTimeoutMs?: number;
+  uploadTimeoutMs?: number;
   restartBaseMs?: number;
   restartMaxMs?: number;
   maxRestarts?: number;
@@ -276,7 +277,7 @@ export class LarkCli {
     // Never call `event stop`: the bus can be shared by unrelated CLI consumers.
   }
 
-  private run(operation: string, args: string[], input?: string): Promise<unknown> {
+  private run(operation: string, args: string[], input?: string | Buffer, timeoutMs = this.opts.commandTimeoutMs ?? 30_000): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const child = spawn(this.opts.binary, this.args(args), { cwd: this.opts.cwd, env: cliEnv(), stdio: ['pipe', 'pipe', 'pipe'], shell: false });
       this.commands.add(child);
@@ -287,7 +288,7 @@ export class LarkCli {
         failure = new Error(`Lark CLI ${operation} timed out`);
         child.kill('SIGTERM');
         reject(failure);
-      }, this.opts.commandTimeoutMs ?? 30_000);
+      }, timeoutMs);
       const collect = (stream: 'stdout' | 'stderr', chunk: Buffer) => {
         if (failure) return;
         if (stream === 'stdout') stdout += chunk.toString(); else stderr += chunk.toString();
@@ -318,14 +319,37 @@ export class LarkCli {
   }
 
   async sendCard(chatId: string, card: Record<string, unknown>, idempotencyKey: string): Promise<string> {
+    return this.sendMessage(chatId, 'interactive', card, idempotencyKey);
+  }
+
+  async sendMessage(chatId: string, msgType: string, content: Record<string, unknown>, idempotencyKey: string): Promise<string> {
     if (!/^oc_[A-Za-z0-9_-]+$/.test(chatId) || !idempotencyKey.trim()) throw new Error('A chat ID and stable idempotency key are required');
-    const result = object(await this.run('sendCard', ['im', '+messages-send', '--as', 'bot', '--chat-id', chatId,
-      '--msg-type', 'interactive', '--content', JSON.stringify(card), '--idempotency-key', idempotencyKey, '--json']));
+    if (!['interactive', 'file', 'image'].includes(msgType)) throw new Error('Unsupported message type');
+    const result = object(await this.run(`send ${msgType}`, ['im', '+messages-send', '--as', 'bot', '--chat-id', chatId,
+      '--msg-type', msgType, '--content', JSON.stringify(content), '--idempotency-key', idempotencyKey, '--json']));
     const data = object(result?.data);
     const message = object(result?.message) ?? object(data?.message);
     const id = nonempty(result?.message_id) ?? nonempty(data?.message_id) ?? nonempty(message?.message_id);
-    if (!id) throw new Error('Lark sendCard returned no message ID receipt');
+    if (!id) throw new Error(`Lark send ${msgType} returned no message ID receipt`);
     return id;
+  }
+
+  /** Bytes go through stdin, so no local path is exposed to (or restricted by) the CLI. */
+  async uploadImage(data: Buffer): Promise<string> {
+    const result = object(await this.run('uploadImage', ['im', 'images', 'create', '--as', 'bot',
+      '--data', JSON.stringify({ image_type: 'message' }), '--file', 'image=-', '--json'], data, this.opts.uploadTimeoutMs ?? 120_000));
+    const key = nonempty(object(result?.data)?.image_key) ?? nonempty(result?.image_key);
+    if (!key || !/^img_[A-Za-z0-9_-]+$/.test(key)) throw new Error('Lark uploadImage returned no image_key');
+    return key;
+  }
+
+  async uploadFile(data: Buffer, name: string, fileType: string): Promise<string> {
+    const fileName = Array.from(name.replace(/[\r\n\0/\\]/g, '_')).slice(0, 200).join('') || 'attachment';
+    const result = object(await this.run('uploadFile', ['api', 'POST', '/open-apis/im/v1/files', '--as', 'bot',
+      '--data', JSON.stringify({ file_type: fileType, file_name: fileName }), '--file', 'file=-', '--json'], data, this.opts.uploadTimeoutMs ?? 120_000));
+    const key = nonempty(object(result?.data)?.file_key) ?? nonempty(result?.file_key);
+    if (!key || !/^file_[A-Za-z0-9_-]+$/.test(key)) throw new Error('Lark uploadFile returned no file_key');
+    return key;
   }
 
   /** Only needed before the operator has ever sent this bridge a P2P message. */

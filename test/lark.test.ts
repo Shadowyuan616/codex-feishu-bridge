@@ -160,6 +160,37 @@ process.stdin.on('end', () => {
   } finally { await f.clean(); }
 });
 
+test('uploads stream bytes through stdin and file messages reuse the send receipt', async () => {
+  const f = await fixture(`
+const fs = require('node:fs'); const args = process.argv.slice(2); const chunks=[];
+process.stdin.on('data', c => chunks.push(c));
+process.stdin.on('end', () => {
+ const input=Buffer.concat(chunks).toString('base64');
+ fs.appendFileSync('calls.ndjson',JSON.stringify({args,input})+'\\n');
+ if (args.includes('images')) process.stdout.write(JSON.stringify({code:0,data:{image_key:'img_v3_abc'}}));
+ else if (args.includes('/open-apis/im/v1/files')) process.stdout.write(JSON.stringify({code:0,data:{file_key:'file_v3_abc'}}));
+ else process.stdout.write(JSON.stringify({ok:true,data:{message_id:'om_file'}}));
+});
+`);
+  const cli = new LarkCli({ binary: f.binary, cwd: f.directory });
+  const bytes = Buffer.from([0, 255, 1, 2]);
+  try {
+    assert.equal(await cli.uploadImage(bytes), 'img_v3_abc');
+    assert.equal(await cli.uploadFile(bytes, '盘点/结果.xlsx', 'xls'), 'file_v3_abc');
+    assert.equal(await cli.sendMessage('oc_target', 'file', { file_key: 'file_v3_abc' }, 'file-key'), 'om_file');
+    const calls = (await readFile(join(f.directory, 'calls.ndjson'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    assert.deepEqual(calls[0].args.slice(0, 3), ['im', 'images', 'create']);
+    assert.equal(calls[0].args[calls[0].args.indexOf('--file') + 1], 'image=-');
+    assert.equal(calls[0].input, bytes.toString('base64'));
+    assert.deepEqual(JSON.parse(calls[1].args[calls[1].args.indexOf('--data') + 1]), { file_type: 'xls', file_name: '盘点_结果.xlsx' });
+    assert.equal(calls[1].args[calls[1].args.indexOf('--file') + 1], 'file=-');
+    assert.equal(calls[1].input, bytes.toString('base64'));
+    assert.equal(calls[2].args[calls[2].args.indexOf('--msg-type') + 1], 'file');
+    assert.equal(calls[2].args[calls[2].args.indexOf('--content') + 1], JSON.stringify({ file_key: 'file_v3_abc' }));
+    await assert.rejects(cli.sendMessage('oc_target', 'text', {}, 'k'), /Unsupported/);
+  } finally { await f.clean(); }
+});
+
 test('buffers events while waiting for the independent stderr ready marker', async () => {
   const f = await fixture(`
 const key=process.argv[process.argv.indexOf('consume')+1]; process.stdin.resume();

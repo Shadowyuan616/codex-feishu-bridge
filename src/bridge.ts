@@ -4,6 +4,7 @@ import { allowedPath, type Config } from './config.js';
 import { Store, stableId, type Binding, type Inbox } from './store.js';
 import { card, directoryCard, sessionCard, latestMarkdown, splitMarkdown, type CardAction } from './cards.js';
 import { orderedSessions, uniqueSessions, RecentPromptReader } from './session-preview.js';
+import { MediaResolver, mediaOptions, type GeneratedImage } from './media.js';
 
 export interface CodexPort extends EventEmitter {
   request<T=any>(method:string,params?:unknown):Promise<T>;
@@ -14,6 +15,9 @@ export interface LarkPort {
   sendCard(chat:string,body:Record<string,unknown>,key:string):Promise<string>;
   updateCard(message:string,body:Record<string,unknown>):Promise<void>;
   ensureDirectChat?(user:string,key:string):Promise<string>;
+  sendMessage?(chat:string,msgType:string,content:Record<string,unknown>,key:string):Promise<string>;
+  uploadImage?(data:Buffer):Promise<string>;
+  uploadFile?(data:Buffer,name:string,fileType:string):Promise<string>;
   health():unknown;
 }
 export type Thread = {id:string;cwd:string;name?:string;preview?:string;status?:{type:string};turns?:any[];updatedAt?:number};
@@ -36,9 +40,14 @@ export class Bridge {
   private liveRequests = new Map<string,string|number>();
   private historyPagination: 'unknown'|'supported'|'unsupported' = 'unknown';
   private readonly previews: RecentPromptReader;
+  private readonly media: MediaResolver;
   private timer?:NodeJS.Timeout;
   constructor(readonly config:Config,readonly store:Store,readonly codex:CodexPort,readonly lark:LarkPort) {
     this.previews = new RecentPromptReader((method, params) => codex.request(method, params));
+    this.media = new MediaResolver(config.allowedRoots, mediaOptions(config), store, lark.uploadImage && lark.uploadFile && lark.sendMessage ? {
+      uploadImage: data => lark.uploadImage!(data),
+      uploadFile: (data, name, fileType) => lark.uploadFile!(data, name, fileType),
+    } : undefined);
     codex.on('notification',(m:string,p:any)=>this.notification(m,p));
     codex.on('serverRequest',(r:any)=>this.serverRequest(r));
     codex.on('disconnect',()=> {
@@ -271,16 +280,29 @@ export class Bridge {
     const ops=items.filter((x:any)=>['commandExecution','fileChange','mcpToolCall','webSearch'].includes(x.type)).slice(-5).map((x:any)=>`- ${x.type} · ${x.status??'已记录'}`);
     const live=this.streams.get(b.thread);
     const liveText=live&&live.turn===latest?.id?[...live.items.entries()].filter(([id,text])=>!assistantItems.some((x:any)=>x.id===id&&String(x.text??'').includes(text))).map(([,text])=>text).join('\n\n'):'';
-    const displayed=[assistantItems.map((x:any)=>String(x.text??'')).join('\n\n'),liveText?`**正在输出**\n${liveText}`:''].filter(Boolean).join('\n\n')||'暂无新的模型回复';
+    // Local image paths are not valid card image keys; only cached uploads are embedded here.
+    const rawDisplayed=[assistantItems.map((x:any)=>String(x.text??'')).join('\n\n'),liveText?`**正在输出**\n${liveText}`:''].filter(Boolean).join('\n\n')||'暂无新的模型回复';
     const heading=`**${textId(t.name||t.preview||t.id)}**\n目录：${t.cwd}\n会话：\`${t.id}\`\n状态：${latest?.status??t.status?.type??'未知'}${ops.length?'\n\n'+ops.join('\n'):''}\n\n`;
     const notice='（以下为截至最新回复的最近内容，较早内容已省略。）\n\n';
     const budget=12_000-Buffer.byteLength(heading,'utf8');
-    let window=latestMarkdown(displayed,budget);
-    if(window.truncated)window=latestMarkdown(displayed,budget-Buffer.byteLength(notice,'utf8'));
-    const body=heading+(window.truncated?notice:'')+window.markdown;
-    const fp=stableId(body);
+    const buildProgress=()=> {
+      const displayed=this.media.sanitize(rawDisplayed,t.cwd)||'暂无新的模型回复';
+      let window=latestMarkdown(displayed,budget);
+      if(window.truncated)window=latestMarkdown(displayed,budget-Buffer.byteLength(notice,'utf8'));
+      const body=heading+(window.truncated?notice:'')+window.markdown;
+      return {body,truncated:window.truncated,fp:stableId(body)};
+    };
+    let {body,truncated,fp}=buildProgress();
     if(force||fp!==b.fingerprint) {
       const pending=this.store.pendingFor(b.thread);
+      let answer:{markdown:string;files:{key:string;name:string}[]}|undefined;
+      if(latest?.id&&latest.status!=='inProgress') {
+        // Linked local images are embedded; linked deliverables follow as file messages.
+        const generated:GeneratedImage[]=items.filter((x:any)=>x.type==='imageGeneration'&&typeof x.result==='string'&&x.result)
+          .map((x:any)=>({id:String(x.id),data:x.result,...(typeof x.savedPath==='string'?{savedPath:x.savedPath}:{})}));
+        answer=await this.media.prepare(messages.join('\n\n'),t.cwd,generated);
+        ({body,truncated,fp}=buildProgress());
+      }
       const progress=card(`${this.config.host} · 最新进展`,body,[
         {label:'刷新',command:`/status ${b.thread}`},{label:'中断当前轮次',command:`/interrupt-confirm ${b.thread}`,type:'danger'},{label:'切换会话',command:'/sessions'}]);
       this.store.putCard(`status:${b.thread}`,b.chat,progress);
@@ -288,9 +310,10 @@ export class Bridge {
       // The event-derived key also makes a crash/retry reuse its original send.
       if(requestId)this.store.putCard(`reply:${requestId}:0`,b.chat,progress);
       // Every complete answer part has a stable key and survives restarts.
-      if(latest?.id&&latest.status!=='inProgress') {
-        splitMarkdown(messages.join('\n\n')).filter(Boolean).forEach((part,i)=>this.store.putCard(`answer:${b.thread}:${latest.id}:${i}`,b.chat,card(`${this.config.host} · 回答 ${i+1}`,part)));
-      } else if(window.truncated) {
+      if(latest?.id&&latest.status!=='inProgress'&&answer) {
+        splitMarkdown(answer.markdown).filter(Boolean).forEach((part,i)=>this.store.putCard(`answer:${b.thread}:${latest.id}:${i}`,b.chat,card(`${this.config.host} · 回答 ${i+1}`,part)));
+        for(const file of answer.files)this.store.putMessage(`answer-file:${b.thread}:${latest.id}:${file.key}`,b.chat,'file',{file_key:file.key});
+      } else if(truncated) {
         this.store.putCard(`overflow:${b.thread}`,b.chat,card('内容较长','最新进展卡片已按模型最新回复向前截取，优先展示最近内容。完整回复仍将在轮次结束后分卡片送达。'));
       }
       for(const p of pending)this.renderPending(p.token);
@@ -383,7 +406,11 @@ export class Bridge {
         if(this.closing)break;
         try {
           const body=JSON.parse(row.content);
-          const message=row.message?(await this.lark.updateCard(row.message,body),row.message):await this.lark.sendCard(row.chat,body,stableId(row.key));
+          let message:string;
+          if((row.msg_type??'interactive')==='interactive')message=row.message?(await this.lark.updateCard(row.message,body),row.message):await this.lark.sendCard(row.chat,body,stableId(row.key));
+          else if(row.message)message=row.message; // file/image messages cannot be edited
+          else if(this.lark.sendMessage)message=await this.lark.sendMessage(row.chat,row.msg_type,body,stableId(row.key));
+          else throw new Error('unsupported_message_type');
           if(!message)throw new Error('missing_message_receipt');
           this.store.sent(row,message);
         } catch { this.store.retry(row,'delivery_failed'); }

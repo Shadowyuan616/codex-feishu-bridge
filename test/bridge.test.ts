@@ -715,3 +715,50 @@ test('stop blocks new inbound work and waits for an in-flight send receipt', asy
   assert.equal(f.codex.calls.length, 0);
   await f.bridge.stop();
 });
+
+test('completed answers embed linked images and send linked deliverables as file messages', async (t) => {
+  const f = fixture(t);
+  const { writeFileSync } = await import('node:fs');
+  mkdirSync(join(f.cwd, 'out'));
+  writeFileSync(join(f.cwd, 'out', 'chart.png'), 'png');
+  writeFileSync(join(f.cwd, 'out', 'inventory.xlsx'), 'xlsx');
+  const uploads: string[] = []; const messages: { chat: string; type: string; content: unknown; key: string }[] = [];
+  Object.assign(f.lark, {
+    async uploadImage() { uploads.push('image'); return 'img_v3_chart'; },
+    async uploadFile(_data: Buffer, name: string) { uploads.push(name); return 'file_v3_inventory'; },
+    async sendMessage(chat: string, type: string, content: unknown, key: string) { messages.push({ chat, type, content, key }); return 'om_file_receipt'; },
+  });
+  const bridge = new Bridge(f.config, f.store, f.codex, f.lark);
+  t.after(() => bridge.stop());
+  const text = '盘点完成。\n![库存趋势](out/chart.png)\n明细见 [库存盘点](out/inventory.xlsx)。';
+  f.thread.turns = [{ id: 'done-turn', status: 'completed', items: [{ id: 'reply', type: 'agentMessage', text }] }];
+  f.store.bind('chat-a', 'ou_owner', f.thread.id, f.cwd);
+  await bridge.refresh(f.store.binding('chat-a', 'ou_owner')!, true);
+  await bridge.flush();
+  const answer = f.lark.sent.find(row => String((row.body.header as any)?.title?.content).includes('回答'));
+  assert.ok(answer);
+  const markdown = visibleText(answer.body);
+  assert.match(markdown, /!\[库存趋势\]\(img_v3_chart\)/);
+  assert.match(markdown, /📎 \*\*库存盘点\*\*（文件见下方消息）/);
+  assert.deepEqual(messages.map(m => [m.chat, m.type, m.content]), [['chat-a', 'file', { file_key: 'file_v3_inventory' }]]);
+  assert.deepEqual(uploads, ['image', 'inventory.xlsx']);
+  // The progress card reuses the uploaded image instead of a raw local path.
+  assert.match(progressMarkdown(f), /!\[库存趋势\]\(img_v3_chart\)/);
+  // Refreshing again neither re-uploads nor resends the file.
+  await bridge.refresh(f.store.binding('chat-a', 'ou_owner')!, true);
+  await bridge.flush();
+  assert.equal(uploads.length, 2);
+  assert.equal(messages.length, 1);
+});
+
+test('progress cards never pass local image paths to Feishu without an upload', async (t) => {
+  const f = fixture(t);
+  const { writeFileSync } = await import('node:fs');
+  writeFileSync(join(f.cwd, 'chart.png'), 'png');
+  f.thread.status = { type: 'active' };
+  f.thread.turns = [{ id: 'active-turn', status: 'inProgress', items: [{ id: 'reply', type: 'agentMessage', text: '中间结果 ![图](chart.png)' }] }];
+  f.store.bind('chat-a', 'ou_owner', f.thread.id, f.cwd);
+  await f.bridge.refresh(f.store.binding('chat-a', 'ou_owner')!, true);
+  assert.ok(progressMarkdown(f).includes('中间结果 🖼 图'));
+  assert.equal(progressMarkdown(f).includes('](chart.png)'), false);
+});

@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 
 export interface Binding { chat: string; user: string; thread: string; cwd: string; fingerprint: string }
 export interface Inbox { id: string; chat: string; user: string; text: string; kind: string; status: string; thread: string | null; created: number }
-export interface Outbox { key: string; chat: string; content: string; version: number; sent_version: number; message: string | null; attempts: number; created: number }
+export interface Outbox { key: string; chat: string; msg_type: string; content: string; version: number; sent_version: number; message: string | null; attempts: number; created: number }
 export interface Pending { token: string; requestId: string; method: string; thread: string; chat: string; user: string; params: string; status: string }
 
 /** SQLite is the durability boundary. Keep it on a local, persistent filesystem. */
@@ -22,8 +22,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS pending(token TEXT PRIMARY KEY, requestId TEXT, method TEXT, thread TEXT, chat TEXT, user TEXT, params TEXT, status TEXT DEFAULT 'pending');
       CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE IF NOT EXISTS direct_chats(user TEXT PRIMARY KEY, chat TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS media(sig TEXT PRIMARY KEY, key TEXT, error TEXT, attempts INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created INTEGER);
       CREATE UNIQUE INDEX IF NOT EXISTS pending_request ON pending(requestId);
     `);
+    // Databases created before attachments only held interactive cards.
+    const columns = this.db.prepare('PRAGMA table_info(outbox)').all().map(x => x.name);
+    if (!columns.includes('msg_type')) this.db.exec("ALTER TABLE outbox ADD COLUMN msg_type TEXT NOT NULL DEFAULT 'interactive'");
   }
   close() { this.db.close(); }
   ingest(e: {id:string; chatId:string; userId:string; text:string; kind:string}): boolean {
@@ -66,19 +70,21 @@ export class Store {
   binding(chat:string,user:string) { return this.db.prepare('SELECT * FROM bindings WHERE chat=? AND user=?').get(chat,user) as unknown as Binding | undefined; }
   bindings(): Binding[] { return this.db.prepare('SELECT * FROM bindings').all() as unknown as Binding[]; }
   fingerprint(chat:string,user:string,value:string) { this.db.prepare('UPDATE bindings SET fingerprint=? WHERE chat=? AND user=?').run(value,chat,user); }
-  putCard(key:string,chat:string,content:Record<string,unknown>) {
+  putCard(key:string,chat:string,content:Record<string,unknown>) { this.putMessage(key,chat,'interactive',content); }
+  /** Non-card messages (file/image) cannot be edited after delivery; keep content stable. */
+  putMessage(key:string,chat:string,msgType:string,content:Record<string,unknown>) {
     // A Feishu receipt belongs to one destination forever, including after rebind.
     key = `${chat}:${key}`;
     const serialized = JSON.stringify(content);
-    this.db.prepare(`INSERT INTO outbox(key,chat,content,created) VALUES(?,?,?,?)
+    this.db.prepare(`INSERT INTO outbox(key,chat,msg_type,content,created) VALUES(?,?,?,?,?)
       ON CONFLICT(key) DO UPDATE SET content=excluded.content, version=outbox.version+1,
       next_at=CASE WHEN outbox.next_at=9007199254740991 THEN outbox.next_at ELSE 0 END,
       attempts=CASE WHEN outbox.next_at=9007199254740991 THEN outbox.attempts ELSE 0 END,
       error=CASE WHEN outbox.next_at=9007199254740991 THEN outbox.error ELSE NULL END
-      WHERE outbox.content!=excluded.content`).run(key,chat,serialized,Date.now());
+      WHERE outbox.content!=excluded.content AND (outbox.msg_type='interactive' OR outbox.sent_version=0)`).run(key,chat,msgType,serialized,Date.now());
   }
   due(now=Date.now()): Outbox[] {
-    return this.db.prepare('SELECT * FROM outbox WHERE sent_version<version AND next_at<=? ORDER BY created LIMIT 20').all(now) as unknown as Outbox[];
+    return this.db.prepare('SELECT * FROM outbox WHERE sent_version<version AND next_at<=? ORDER BY created, rowid LIMIT 20').all(now) as unknown as Outbox[];
   }
   sent(row:Outbox,message:string) { this.db.prepare('UPDATE outbox SET message=?,sent_version=?,attempts=0,next_at=0,error=NULL WHERE key=?').run(message,row.version,row.key); }
   retry(row:Outbox,error:string,now=Date.now()) {
@@ -86,6 +92,17 @@ export class Store {
     // after 50 min require inspection rather than risking a duplicate new message.
     const next = !row.message && now-row.created>50*60_000 ? Number.MAX_SAFE_INTEGER : now+Math.min(300_000,1000*2**Math.min(row.attempts,8));
     this.db.prepare('UPDATE outbox SET attempts=attempts+1,next_at=?,error=? WHERE key=?').run(next,error.slice(0,200),row.key);
+  }
+  mediaGet(sig:string) { return this.db.prepare('SELECT key,error,next_at FROM media WHERE sig=?').get(sig) as unknown as {key:string|null;error:string|null;next_at:number}|undefined; }
+  mediaPut(sig:string,key:string) {
+    this.db.prepare('INSERT INTO media(sig,key,created) VALUES(?,?,?) ON CONFLICT(sig) DO UPDATE SET key=excluded.key,error=NULL,next_at=0').run(sig,key,Date.now());
+  }
+  mediaFail(sig:string,error:string,now=Date.now()) {
+    const attempts=Number(this.db.prepare('SELECT attempts FROM media WHERE sig=?').get(sig)?.attempts??0)+1;
+    // Back off failed uploads (missing scope, oversized file) instead of retrying every poll.
+    this.db.prepare(`INSERT INTO media(sig,error,attempts,next_at,created) VALUES(?,?,?,?,?)
+      ON CONFLICT(sig) DO UPDATE SET error=excluded.error,attempts=excluded.attempts,next_at=excluded.next_at`)
+      .run(sig,error.slice(0,200),attempts,now+Math.min(3_600_000,60_000*2**Math.min(attempts-1,6)),now);
   }
   pending(p:Pending) {
     this.db.prepare(`INSERT INTO pending(token,requestId,method,thread,chat,user,params,status) VALUES(?,?,?,?,?,?,?,?)
